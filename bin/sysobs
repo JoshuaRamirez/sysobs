@@ -1078,17 +1078,30 @@ class Capture:
 
     # ---- optional enrichment: where an address actually is
     def c_rdns(self):
+        """Names for addresses. Resolved in parallel with a short timeout: a
+        dozen silent PTR lookups must not become a dozen serial stalls."""
+        from concurrent.futures import ThreadPoolExecutor
         idx = self.s.load_dim("ip_address")
-        n = 0
-        for row in idx.values():
-            if row.get("rdns") or row.get("scope") in ("wildcard", "unknown"):
-                continue
+        todo = [r for r in idx.values()
+                if not r.get("rdns") and r.get("scope") not in ("wildcard", "unknown")]
+        prev = pysocket.getdefaulttimeout()
+        pysocket.setdefaulttimeout(2)
+
+        def lookup(row):
             try:
-                row["rdns"] = pysocket.gethostbyaddr(row["address"].split("%")[0])[0]
-                n += 1
+                return row, pysocket.gethostbyaddr(row["address"].split("%")[0])[0]
             except (OSError, UnicodeError):
-                row["rdns"] = "-"
-        return n, 0, "reverse DNS resolved through the system resolver"
+                return row, "-"      # asked, no answer — distinct from never asked
+
+        n = 0
+        try:
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                for row, name in pool.map(lookup, todo):
+                    row["rdns"] = name
+                    n += name != "-"
+        finally:
+            pysocket.setdefaulttimeout(prev)
+        return n, 0, f"{n}/{len(todo)} addresses resolved through the system resolver"
 
     def c_geo(self):
         """Opt-in only. Sends PUBLIC addresses (never private/loopback) to
