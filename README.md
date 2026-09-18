@@ -69,9 +69,33 @@ table:
 | `volume_sample` | disk usage per volume |
 | `disk_io_sample` | throughput per device |
 | `interface_sample` | packets and bytes per interface |
+| `power_sample` | adapter watts vs system demand, headroom, battery current, SoC |
 
 Three views make the joins unnecessary for ordinary questions: `v_process`,
 `v_connection`, `v_open_file`.
+
+## Power
+
+`power_sample` exists because the first real investigation with this tool found
+a 16-core, 128 GB MacBook Pro clamped to 27 W by a 30 W USB-C charger while it
+was asking for 100 W. Every other table looked healthy — 12% CPU, 89% memory
+free, no fd or socket leaks — and the load average was 222.
+
+Two details that make the reading trustworthy:
+
+- the IORegistry reports battery current as an **unsigned** 64-bit word, so a
+  pack *discharging while plugged in* — the exact state worth catching — reads
+  as `18446744073709551583`, not `-33`. `sysobs` undoes the wrap.
+- `PowerTelemetryData.BatteryPower` disagreed with reality (it claimed
+  `-522 mW` while the pack charged at `+6110 mA`), so the `power_capped`
+  verdict is derived from `InstantAmperage`, which matched observation in both
+  the starved and the recovered state.
+
+A capped machine announces itself in `collector_run`:
+
+```
+~ power: POWER CAPPED: pd charger supplies 30W, machine is asking for 27.4W
+```
 
 ## Referential integrity
 
