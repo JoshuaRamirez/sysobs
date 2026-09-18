@@ -147,6 +147,16 @@ _t("host_sample", "fact",
    ["snapshot_id"], {"snapshot_id": ("snapshot", "snapshot_id")},
    "the machine-wide reading at snapshot time")
 
+_t("power_sample", "fact",
+   ["snapshot_id", "adapter_watts", "adapter_description", "adapter_voltage_mv",
+    "adapter_current_ma", "external_connected", "charging",
+    "system_power_in_mw", "system_load_mw", "adapter_efficiency_loss_mw",
+    "battery_power_mw", "battery_ma", "soc_pct", "daily_min_soc", "daily_max_soc",
+    "cycle_count", "max_capacity_pct", "design_capacity_mah", "nominal_capacity_mah",
+    "headroom_mw", "power_capped"],
+   ["snapshot_id"], {"snapshot_id": ("snapshot", "snapshot_id")},
+   "power delivery: what the machine wants vs what the adapter can give")
+
 _t("process", "fact",
    ["snapshot_id", "pid", "ppid", "pgid", "uid", "username", "command_id",
     "argv", "started_at", "elapsed_s", "tty"],
@@ -621,6 +631,7 @@ class Capture:
         # order matters: volumes register mount points before any file is resolved
         self._collect("host", self.c_host)
         self._collect("volume", self.c_volumes)
+        self._collect("power", self.c_power)
         self._collect("host_sample", self.c_host_sample)
         self._collect("disk_io", self.c_disk_io)
         self._collect("interface", self.c_interfaces)
@@ -702,6 +713,75 @@ class Capture:
                 if m:
                     Capture._mount_types[m.group(2)] = m.group(3)
         return Capture._mount_types.get(mount, "")
+
+    # ---- power delivery
+    _U64 = 1 << 64
+
+    @classmethod
+    def _signed(cls, v):
+        """IORegistry reports current as an unsigned 64-bit word, so a battery
+        that is DISCHARGING reads as 18446744073709551583 rather than -33. A
+        machine drawing from its battery while plugged in is exactly the state
+        worth catching, so the wrap has to be undone, not clamped to zero."""
+        if v is None:
+            return ""
+        return v - cls._U64 if v > cls._U64 // 2 else v
+
+    def c_power(self):
+        rc, out = _run(["ioreg", "-rc", "AppleSmartBattery"], 20)
+        if rc != 0 or not out.strip():
+            return 0, 1, "ioreg AppleSmartBattery unavailable"
+
+        def grab(key, sep="="):
+            m = re.search(rf'"{key}"\s*{sep}\s*(-?\d+)', out)
+            return int(m.group(1)) if m else None
+
+        watts = grab("Watts")
+        pin = grab("SystemPowerIn")
+        sysload = grab("SystemLoad")
+        bp = self._signed(grab("BatteryPower"))
+        ba = self._signed(grab("InstantAmperage", sep="="))
+        if ba == "":
+            ba = self._signed(grab("Amperage"))
+        soc = grab("StateOfCharge")
+        cap_mw = watts * 1000 if watts else None
+        demand = sysload if sysload is not None else pin
+        headroom = (cap_mw - demand) if (cap_mw is not None and demand is not None) else ""
+        # capped when demand is within 10% of what the adapter can deliver, or
+        # when the battery is being drained despite an external supply
+        capped = ""
+        if cap_mw and demand is not None:
+            capped = int(demand >= cap_mw * 0.9)
+        # Trust the current, not the power field: with a 140W supply and the
+        # battery charging at +6110mA, PowerTelemetryData still reported
+        # BatteryPower=-522mW. InstantAmperage matched reality in both the
+        # starved (-33mA on AC) and the recovered state, so it decides.
+        if isinstance(ba, int) and ba < 0 and external:
+            capped = 1
+        external = int("ExternalConnected\" = Yes" in out)
+        desc = re.search(r'"Description"="([^"]+)"', out)
+        self.s.fact("power_sample", {
+            "snapshot_id": self.sid, "adapter_watts": watts,
+            "adapter_description": desc.group(1) if desc else "",
+            "adapter_voltage_mv": grab("AdapterVoltage"),
+            "adapter_current_ma": grab("Current"),
+            "external_connected": external,
+            "charging": int('"IsCharging" = Yes' in out),
+            "system_power_in_mw": pin, "system_load_mw": sysload,
+            "adapter_efficiency_loss_mw": grab("AdapterEfficiencyLoss"),
+            "battery_power_mw": bp, "battery_ma": ba, "soc_pct": soc,
+            "daily_min_soc": grab("DailyMinSoc"), "daily_max_soc": grab("DailyMaxSoc"),
+            "cycle_count": grab("CycleCount"),
+            "max_capacity_pct": grab("MaxCapacity"),
+            "design_capacity_mah": grab("DesignCapacity"),
+            "nominal_capacity_mah": grab("NominalChargeCapacity"),
+            "headroom_mw": headroom, "power_capped": capped,
+        })
+        msg = ""
+        if capped == 1:
+            msg = (f"POWER CAPPED: {desc.group(1) if desc else 'adapter'} supplies "
+                   f"{watts}W, machine is asking for {(demand or 0)/1000:.1f}W")
+        return 1, 1 if capped == 1 else 0, msg
 
     # ---- machine-wide cpu / ram / paging / aggregate net + disk
     def c_host_sample(self):
@@ -1265,6 +1345,11 @@ INT_COLS = {
     "swapouts", "net_pkts_in", "net_pkts_out", "disk_reads", "disk_writes",
     "priority", "nice", "mtu", "transfers_per_s", "capacity_pct", "recv_q",
     "send_q", "duration_ms", "rx_bytes", "tx_bytes", "bytes_in", "bytes_out",
+    "adapter_watts", "adapter_voltage_mv", "adapter_current_ma",
+    "external_connected", "charging", "system_power_in_mw", "system_load_mw",
+    "adapter_efficiency_loss_mw", "battery_power_mw", "battery_ma", "soc_pct",
+    "daily_min_soc", "daily_max_soc", "cycle_count", "max_capacity_pct",
+    "design_capacity_mah", "nominal_capacity_mah", "headroom_mw", "power_capped",
 }
 
 
@@ -1640,6 +1725,11 @@ def selftest() -> int:
 
     tail = Capture._NETSTAT_TAIL.match(
         "LISTEN                 0            0  131072  131072       python3.12:83615  00100 ")
+    check("unsigned wrap: discharging", Capture._signed(18446744073709551583), -33)
+    check("unsigned wrap: charging", Capture._signed(6110), 6110)
+    check("unsigned wrap: zero", Capture._signed(0), 0)
+    check("unsigned wrap: absent", Capture._signed(None), "")
+
     check("netstat tail pid", tail.group(6) if tail else None, "83615")
     tail2 = Capture._NETSTAT_TAIL.match(
         "ESTABLISHED      1363008         3261  937176  132104 Google Chrome He:94117  00102 ")
@@ -1705,7 +1795,7 @@ def selftest() -> int:
 
     for line in fails:
         print(f"FAIL {line}")
-    total = 33
+    total = 37
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
