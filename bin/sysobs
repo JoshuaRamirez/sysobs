@@ -1,0 +1,1870 @@
+#!/usr/bin/env python3
+"""sysobs — a normalized, referentially-intact log of what this machine is doing.
+
+Substrate (derived, never hand-written): ps, lsof, netstat, nettop, top, df,
+iostat, vm_stat, sysctl, and libproc via ctypes. Every snapshot is written as a
+STAR SCHEMA spread over one CSV per table under $SYSOBS_HOME/tables, so nothing
+is stored twice: a file path, an IP address, a port, a volume, an executable
+and an interface each live exactly once in a dimension table and are referenced
+by id from the per-snapshot fact rows.
+
+    sysobs snapshot [--files none|own|all] [--rdns] [--geo online] [--json]
+    sysobs watch --interval 60 [--count N]      repeated snapshots
+    sysobs list [--json]                        snapshots on record
+    sysobs show <snapshot|latest> [--json]      one snapshot, resolved
+    sysobs top <snapshot|latest> [--by cpu|rss|net|files|sockets]
+    sysobs verify [--json]                      referential integrity report
+    sysobs db [--rebuild] [--json]              build SQLite mirror with real FKs
+    sysobs query <sql> [--json]                 run SQL against the mirror
+    sysobs schema [--ddl|--json]                the schema, keys and references
+    sysobs prune --days N [--go]                drop old snapshots, keep refs intact
+    sysobs selftest                             behaviour fixtures
+
+Uniform interface: --json on every reading command; exit 0 ok, 1 finding/failure,
+2 usage. Values carry a `source` so a degraded collector is visible, not silent.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import ctypes
+import hashlib
+import ipaddress
+import json
+import os
+import platform
+import re
+import socket as pysocket
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.1.0"
+SCHEMA_VERSION = 1
+
+HOME = Path.home()
+ROOT = Path(os.environ.get(
+    "SYSOBS_HOME",
+    Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state")) / "sysobs",
+))
+TABLES = ROOT / "tables"
+DB_PATH = ROOT / "sysobs.sqlite"
+
+csv.field_size_limit(16 * 1024 * 1024)
+
+
+# ============================================================ schema
+# Each table: kind ("dim" = deduped across all time, "fact" = per snapshot),
+# columns, primary key, and foreign keys {column: (table, column)}.
+# The schema is the single source of truth: the CSV headers, the SQLite DDL and
+# the integrity checker are all generated from it, so they cannot drift apart.
+
+class Table:
+    def __init__(self, name, kind, columns, pk, fks=None, doc=""):
+        self.name, self.kind, self.columns = name, kind, columns
+        self.pk = pk
+        self.fks = fks or {}
+        self.doc = doc
+
+    @property
+    def path(self) -> Path:
+        return TABLES / f"{self.name}.csv"
+
+
+SCHEMA: dict[str, Table] = {}
+
+
+def _t(name, kind, columns, pk, fks=None, doc=""):
+    SCHEMA[name] = Table(name, kind, columns, pk, fks, doc)
+
+
+# ---- dimensions (stable identity, deduped, first_seen/last_seen maintained)
+_t("host", "dim",
+   ["host_id", "hostname", "hw_uuid", "model", "cpu_brand", "ncpu", "mem_bytes",
+    "os_name", "os_version", "kernel", "arch", "first_seen", "last_seen"],
+   ["host_id"], {}, "the machine itself")
+
+_t("volume", "dim",
+   ["volume_id", "device", "mount_point", "fs_type", "first_seen", "last_seen"],
+   ["volume_id"], {}, "a mounted filesystem; the location a file path lands on")
+
+_t("disk_device", "dim",
+   ["device_id", "device_name", "first_seen", "last_seen"],
+   ["device_id"], {}, "a block device as iostat names it")
+
+_t("interface", "dim",
+   ["interface_id", "name", "mtu", "mac", "first_seen", "last_seen"],
+   ["interface_id"], {}, "a network interface")
+
+_t("file", "dim",
+   ["file_id", "path", "directory", "basename", "extension", "volume_id",
+    "first_seen", "last_seen"],
+   ["file_id"], {"volume_id": ("volume", "volume_id")},
+   "THE normalized file location: every path in the log points here, once")
+
+_t("command", "dim",
+   ["command_id", "exe_path", "basename", "file_id", "first_seen", "last_seen"],
+   ["command_id"], {"file_id": ("file", "file_id")},
+   "an executable image, normalized onto its file location")
+
+_t("ip_address", "dim",
+   ["address_id", "address", "family", "scope", "is_local", "rdns",
+    "geo_source", "geo_country", "geo_region", "geo_city", "geo_org",
+    "first_seen", "last_seen"],
+   ["address_id"], {}, "an IP address seen at either end of a socket")
+
+_t("port", "dim",
+   ["port_id", "protocol", "port", "service_name", "first_seen", "last_seen"],
+   ["port_id"], {}, "a protocol/port pair, named from /etc/services when known")
+
+# ---- facts (one set per snapshot)
+_t("snapshot", "fact",
+   ["snapshot_id", "host_id", "started_at", "finished_at", "duration_ms",
+    "tool_version", "schema_version", "euid", "privileged", "files_mode",
+    "note"],
+   ["snapshot_id"], {"host_id": ("host", "host_id")}, "one capture run")
+
+_t("collector_run", "fact",
+   ["snapshot_id", "collector", "status", "degraded", "duration_ms", "rows",
+    "message"],
+   ["snapshot_id", "collector"], {"snapshot_id": ("snapshot", "snapshot_id")},
+   "what each collector managed to see, so a gap is recorded not implied")
+
+_t("host_sample", "fact",
+   ["snapshot_id", "uptime_s", "load1", "load5", "load15",
+    "cpu_user_pct", "cpu_sys_pct", "cpu_idle_pct",
+    "procs_total", "procs_running", "procs_sleeping", "threads_total",
+    "mem_total_bytes", "mem_used_bytes", "mem_unused_bytes", "mem_wired_bytes",
+    "mem_compressed_bytes", "mem_active_bytes", "mem_inactive_bytes",
+    "mem_free_bytes", "mem_speculative_bytes", "mem_purgeable_bytes",
+    "page_size", "pageins", "pageouts", "swapins", "swapouts",
+    "swap_total_bytes", "swap_used_bytes", "swap_free_bytes",
+    "net_pkts_in", "net_pkts_out", "net_bytes_in", "net_bytes_out",
+    "disk_reads", "disk_writes", "disk_bytes_read", "disk_bytes_written"],
+   ["snapshot_id"], {"snapshot_id": ("snapshot", "snapshot_id")},
+   "the machine-wide reading at snapshot time")
+
+_t("process", "fact",
+   ["snapshot_id", "pid", "ppid", "pgid", "uid", "username", "command_id",
+    "argv", "started_at", "elapsed_s", "tty"],
+   ["snapshot_id", "pid"],
+   {"snapshot_id": ("snapshot", "snapshot_id"), "command_id": ("command", "command_id")},
+   "process identity within a snapshot")
+
+_t("process_sample", "fact",
+   ["snapshot_id", "pid", "state", "priority", "nice", "cpu_pct", "mem_pct",
+    "rss_bytes", "vsz_bytes", "cpu_time_s", "user_time_s", "system_time_s",
+    "threads", "faults", "pageins", "cow_faults", "csw", "syscalls_mach",
+    "syscalls_unix", "messages_sent", "messages_received", "source"],
+   ["snapshot_id", "pid"],
+   {"snapshot_id": ("snapshot", "snapshot_id"), "pid": None},  # composite, see FACT_PARENT
+   "cpu/ram reading for one process")
+
+_t("process_net_sample", "fact",
+   ["snapshot_id", "pid", "bytes_in", "bytes_out", "source"],
+   ["snapshot_id", "pid"],
+   {"snapshot_id": ("snapshot", "snapshot_id")},
+   "per-process network volume (nettop)")
+
+_t("volume_sample", "fact",
+   ["snapshot_id", "volume_id", "total_bytes", "used_bytes", "avail_bytes",
+    "capacity_pct", "inodes_used", "inodes_free"],
+   ["snapshot_id", "volume_id"],
+   {"snapshot_id": ("snapshot", "snapshot_id"), "volume_id": ("volume", "volume_id")},
+   "disk usage per mounted volume")
+
+_t("disk_io_sample", "fact",
+   ["snapshot_id", "device_id", "kb_per_transfer", "transfers_per_s", "mb_per_s"],
+   ["snapshot_id", "device_id"],
+   {"snapshot_id": ("snapshot", "snapshot_id"), "device_id": ("disk_device", "device_id")},
+   "disk throughput per device")
+
+_t("interface_sample", "fact",
+   ["snapshot_id", "interface_id", "ipkts", "ierrs", "ibytes", "opkts", "oerrs",
+    "obytes", "collisions"],
+   ["snapshot_id", "interface_id"],
+   {"snapshot_id": ("snapshot", "snapshot_id"), "interface_id": ("interface", "interface_id")},
+   "network volume per interface")
+
+_t("process_file", "fact",
+   ["snapshot_id", "pid", "fd", "fd_type", "file_id", "access"],
+   ["snapshot_id", "pid", "fd", "file_id"],
+   {"snapshot_id": ("snapshot", "snapshot_id"), "file_id": ("file", "file_id")},
+   "which process holds which file location open")
+
+_t("socket", "fact",
+   ["snapshot_id", "socket_seq", "pid", "fd", "protocol",
+    "local_address_id", "local_port_id", "remote_address_id", "remote_port_id",
+    "state", "recv_q", "send_q", "rx_bytes", "tx_bytes", "source"],
+   ["snapshot_id", "socket_seq"],
+   {"snapshot_id": ("snapshot", "snapshot_id"),
+    "local_address_id": ("ip_address", "address_id"),
+    "local_port_id": ("port", "port_id"),
+    "remote_address_id": ("ip_address", "address_id"),
+    "remote_port_id": ("port", "port_id")},
+   "one open socket: who, which port, which addresses, how much moved")
+
+# Fact tables whose rows must correspond to a process row in the SAME snapshot.
+# Expressed separately because a composite FK cannot be written as a single column.
+FACT_PARENT = {
+    "process_sample": ("process", ["snapshot_id", "pid"]),
+    "process_net_sample": ("process", ["snapshot_id", "pid"]),
+    "process_file": ("process", ["snapshot_id", "pid"]),
+    "socket": ("process", ["snapshot_id", "pid"]),
+}
+SCHEMA["process_sample"].fks.pop("pid", None)
+
+
+# ============================================================ small helpers
+def _run(cmd: list[str], timeout: float = 60) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           errors="replace")
+        return p.returncode, p.stdout
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except Exception:  # noqa: BLE001
+        return 126, ""
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _hid(prefix: str, *parts: str) -> str:
+    h = hashlib.sha1("\x1f".join(parts).encode("utf-8", "surrogateescape")).hexdigest()
+    return f"{prefix}_{h[:16]}"
+
+
+_SUFFIX = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5}
+
+
+def _bytes(text: str) -> int | str:
+    """'8698M' -> bytes. Returns '' when the token is not a size."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([BKMGTP])?", text.strip())
+    if not m:
+        return ""
+    return int(float(m.group(1)) * _SUFFIX.get(m.group(2) or "B", 1))
+
+
+def _num(text, cast=float):
+    try:
+        return cast(text)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _etime_seconds(etime: str) -> int | str:
+    """ps ELAPSED: [[dd-]hh:]mm:ss -> seconds."""
+    etime = etime.strip()
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", etime)
+    if not m:
+        return ""
+    d, h, mi, s = (int(x) if x else 0 for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + s
+
+
+def _cputime_seconds(t: str):
+    """ps TIME: [mmm:]ss.hh -> seconds."""
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", t.strip())
+    if not m:
+        return ""
+    d, h, mi, s = m.groups()
+    return round(int(d or 0) * 86400 + int(h or 0) * 3600 + int(mi) * 60 + float(s), 2)
+
+
+# ============================================================ libproc (ctypes)
+class _TaskInfo(ctypes.Structure):
+    _fields_ = [
+        ("pti_virtual_size", ctypes.c_uint64), ("pti_resident_size", ctypes.c_uint64),
+        ("pti_total_user", ctypes.c_uint64), ("pti_total_system", ctypes.c_uint64),
+        ("pti_threads_user", ctypes.c_uint64), ("pti_threads_system", ctypes.c_uint64),
+        ("pti_policy", ctypes.c_int32), ("pti_faults", ctypes.c_int32),
+        ("pti_pageins", ctypes.c_int32), ("pti_cow_faults", ctypes.c_int32),
+        ("pti_messages_sent", ctypes.c_int32), ("pti_messages_received", ctypes.c_int32),
+        ("pti_syscalls_mach", ctypes.c_int32), ("pti_syscalls_unix", ctypes.c_int32),
+        ("pti_csw", ctypes.c_int32), ("pti_threadnum", ctypes.c_int32),
+        ("pti_numrunning", ctypes.c_int32), ("pti_priority", ctypes.c_int32),
+    ]
+
+
+class LibProc:
+    """Kernel task info per pid. Denied for processes we do not own — which is
+    reported as a missing enrichment, never as a zero."""
+
+    PROC_PIDTASKINFO = 4
+
+    def __init__(self):
+        try:
+            self.lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+            self.ok = hasattr(self.lib, "proc_pidinfo")
+        except OSError:
+            self.lib, self.ok = None, False
+        self._buf = ctypes.create_string_buffer(4096)
+
+    def task_info(self, pid: int) -> dict | None:
+        if not self.ok:
+            return None
+        ti = _TaskInfo()
+        n = self.lib.proc_pidinfo(pid, self.PROC_PIDTASKINFO, ctypes.c_uint64(0),
+                                  ctypes.byref(ti), ctypes.sizeof(ti))
+        if n != ctypes.sizeof(ti):
+            return None
+        return {
+            "rss_bytes": ti.pti_resident_size, "vsz_bytes": ti.pti_virtual_size,
+            "user_time_s": round(ti.pti_total_user / 1e9, 3),
+            "system_time_s": round(ti.pti_total_system / 1e9, 3),
+            "threads": ti.pti_threadnum, "faults": ti.pti_faults,
+            "pageins": ti.pti_pageins, "cow_faults": ti.pti_cow_faults,
+            "csw": ti.pti_csw, "syscalls_mach": ti.pti_syscalls_mach,
+            "syscalls_unix": ti.pti_syscalls_unix,
+            "messages_sent": ti.pti_messages_sent,
+            "messages_received": ti.pti_messages_received,
+        }
+
+    def exe_path(self, pid: int) -> str:
+        if not self.ok:
+            return ""
+        n = self.lib.proc_pidpath(pid, self._buf, 4096)
+        return self._buf.value.decode("utf-8", "replace") if n > 0 else ""
+
+
+# ============================================================ the store
+class Store:
+    """CSV-per-table on disk. Dimensions are read back in, deduped by id, and
+    rewritten with a refreshed last_seen; facts are appended."""
+
+    def __init__(self, root: Path = None):
+        self.root = root or ROOT
+        self.tables = self.root / "tables"
+        self.tables.mkdir(parents=True, exist_ok=True)
+        self.dims: dict[str, dict[str, dict]] = {}
+        self.pending: dict[str, list[dict]] = {}
+
+    # ---- reading
+    def read(self, table: str) -> list[dict]:
+        p = self.tables / f"{table}.csv"
+        if not p.exists():
+            return []
+        with p.open(newline="", encoding="utf-8") as fh:
+            return list(csv.DictReader(fh))
+
+    def load_dim(self, table: str) -> dict[str, dict]:
+        if table not in self.dims:
+            key = SCHEMA[table].pk[0]
+            self.dims[table] = {r[key]: r for r in self.read(table)}
+        return self.dims[table]
+
+    # ---- writing
+    def dim(self, table: str, row: dict, seen: str) -> str:
+        """Insert-or-touch a dimension row. Returns its id."""
+        key_col = SCHEMA[table].pk[0]
+        idx = self.load_dim(table)
+        rid = row[key_col]
+        cur = idx.get(rid)
+        if cur is None:
+            row = {c: row.get(c, "") for c in SCHEMA[table].columns}
+            row["first_seen"] = seen
+            row["last_seen"] = seen
+            idx[rid] = row
+        else:
+            cur["last_seen"] = seen
+            # fill in fields that were blank before (e.g. rdns learned later)
+            for c, v in row.items():
+                if v not in ("", None) and not cur.get(c):
+                    cur[c] = v
+        return rid
+
+    def fact(self, table: str, row: dict) -> None:
+        self.pending.setdefault(table, []).append(row)
+
+    def flush(self) -> dict[str, int]:
+        written = {}
+        for name, table in SCHEMA.items():
+            if table.kind == "dim" and name in self.dims:
+                self._rewrite(table, list(self.dims[name].values()))
+                written[name] = len(self.dims[name])
+            elif table.kind == "fact" and self.pending.get(name):
+                self._append(table, self.pending[name])
+                written[name] = len(self.pending[name])
+        self.pending.clear()
+        return written
+
+    def _write_rows(self, table: Table, rows: list[dict], mode: str) -> None:
+        exists = table.path.exists() and table.path.stat().st_size > 0
+        tmp = table.path if mode == "a" else table.path.with_suffix(".csv.tmp")
+        with tmp.open(mode, newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=table.columns, extrasaction="ignore")
+            if mode == "w" or not exists:
+                w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, "") for c in table.columns})
+        if mode != "a":
+            tmp.replace(table.path)
+
+    def _append(self, table: Table, rows: list[dict]) -> None:
+        self._write_rows(table, rows, "a")
+
+    def _rewrite(self, table: Table, rows: list[dict]) -> None:
+        self._write_rows(table, rows, "w")
+
+    def replace(self, table: str, rows: list[dict]) -> None:
+        self._rewrite(SCHEMA[table], rows)
+
+
+# ============================================================ resolvers
+def classify_address(addr: str) -> tuple[str, str, str]:
+    """-> (family, scope, is_local). Scope is the offline 'where' of an address:
+    everything except `public` is resolvable without asking anyone."""
+    raw = addr.split("%", 1)[0]
+    if raw in ("*", ""):
+        return ("any", "wildcard", "1")
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return ("unknown", "unknown", "")
+    family = "ipv6" if ip.version == 6 else "ipv4"
+    if ip.is_loopback:
+        scope = "loopback"
+    elif ip.is_link_local:
+        scope = "link-local"
+    elif ip.is_multicast:
+        scope = "multicast"
+    elif ip.is_unspecified:
+        scope = "wildcard"
+    elif ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10"):
+        scope = "cgnat"
+    elif ip.is_private:
+        scope = "private"
+    elif ip.is_reserved:
+        scope = "reserved"
+    else:
+        scope = "public"
+    return (family, scope, "1" if scope != "public" else "0")
+
+
+def load_services() -> dict[tuple[str, int], str]:
+    out: dict[tuple[str, int], str] = {}
+    try:
+        with open("/etc/services", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) < 2 or "/" not in parts[1]:
+                    continue
+                port_s, proto = parts[1].split("/", 1)
+                if port_s.isdigit():
+                    out.setdefault((proto.lower(), int(port_s)), parts[0])
+    except OSError:
+        pass
+    return out
+
+
+class Refs:
+    """Turns raw strings into dimension ids. This is where 'normalize per file
+    location' actually happens: a path is hashed once, attached to the volume it
+    lives on, and every later mention is just that id."""
+
+    def __init__(self, store: Store, seen: str):
+        self.s, self.seen = store, seen
+        self.mounts: list[tuple[str, str]] = []   # (mount_point, volume_id), longest first
+        self.services = load_services()
+        self._file_cache: dict[str, str] = {}
+        self._addr_cache: dict[str, str] = {}
+        self._port_cache: dict[tuple[str, int], str] = {}
+
+    def register_mount(self, volume_id: str, mount_point: str) -> None:
+        self.mounts.append((mount_point, volume_id))
+        self.mounts.sort(key=lambda mv: len(mv[0]), reverse=True)
+
+    def volume_of(self, path: str) -> str:
+        for mount, vid in self.mounts:
+            if path == mount or path.startswith(mount.rstrip("/") + "/"):
+                return vid
+        return ""
+
+    def file(self, path: str) -> str:
+        if not path:
+            return ""
+        cached = self._file_cache.get(path)
+        if cached:
+            return cached
+        fid = _hid("f", path)
+        base = os.path.basename(path)
+        ext = os.path.splitext(base)[1].lstrip(".").lower() if "." in base[1:] else ""
+        self.s.dim("file", {
+            "file_id": fid, "path": path, "directory": os.path.dirname(path),
+            "basename": base, "extension": ext, "volume_id": self.volume_of(path),
+        }, self.seen)
+        self._file_cache[path] = fid
+        return fid
+
+    def command(self, exe_path: str) -> str:
+        if not exe_path:
+            return ""
+        cid = _hid("c", exe_path)
+        self.s.dim("command", {
+            "command_id": cid, "exe_path": exe_path,
+            "basename": os.path.basename(exe_path), "file_id": self.file(exe_path),
+        }, self.seen)
+        return cid
+
+    def address(self, addr: str) -> str:
+        if not addr or addr in ("*",):
+            return ""
+        cached = self._addr_cache.get(addr)
+        if cached:
+            return cached
+        family, scope, is_local = classify_address(addr)
+        aid = _hid("a", addr)
+        self.s.dim("ip_address", {
+            "address_id": aid, "address": addr, "family": family, "scope": scope,
+            "is_local": is_local,
+        }, self.seen)
+        self._addr_cache[addr] = aid
+        return aid
+
+    def port(self, protocol: str, port) -> str:
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return ""
+        proto = (protocol or "").lower()
+        key = (proto, port)
+        cached = self._port_cache.get(key)
+        if cached:
+            return cached
+        pid_ = f"p_{proto}_{port}"
+        self.s.dim("port", {
+            "port_id": pid_, "protocol": proto, "port": port,
+            "service_name": self.services.get(key, ""),
+        }, self.seen)
+        self._port_cache[key] = pid_
+        return pid_
+
+
+def split_hostport(text: str) -> tuple[str, str]:
+    """lsof and netstat write endpoints four different ways:
+    '*:443', '1.2.3.4:443', '[::1]:5000' (lsof) and '127.0.0.1.48793',
+    '2607:fb91:4100:d.54272', '*.*' (netstat). The separator is simply whichever
+    of ':' or '.' comes LAST and is followed by a port-shaped token."""
+    text = text.strip()
+    if not text or text in ("*", "*:*", "*.*"):
+        return ("", "")
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        port = rest.lstrip(":")
+        return (host, "" if port in ("*", "") else port)
+    try:                      # a bare address: '.10' is an octet, not a port
+        ipaddress.ip_address(text.split("%", 1)[0])
+        return (text, "")
+    except ValueError:
+        pass
+    cut = max(text.rfind(":"), text.rfind("."))
+    if cut > 0:
+        host, port = text[:cut], text[cut + 1:]
+        if port.isdigit() or port == "*":
+            return ("" if host == "*" else host, "" if port == "*" else port)
+    return ("" if text == "*" else text, "")
+
+
+
+# ============================================================ capture
+class Capture:
+    """One snapshot. Each collector records its own outcome in collector_run so
+    a missing table is always explained rather than looking like 'nothing there'."""
+
+    def __init__(self, store: Store, files_mode="own", rdns=False, geo="off", note=""):
+        self.s = store
+        self.files_mode, self.rdns, self.geo, self.note = files_mode, rdns, geo, note
+        self.started = time.time()
+        self.seen = now_iso()
+        self.sid = self._new_snapshot_id()
+        self.refs = Refs(store, self.seen)
+        self.libproc = LibProc()
+        self.pids: set[int] = set()
+        self.runs: list[dict] = []
+        self.host_id = ""
+
+    def _new_snapshot_id(self) -> str:
+        stamp = datetime.now(timezone.utc).strftime("s_%Y%m%dT%H%M%SZ")
+        existing = {r["snapshot_id"] for r in self.s.read("snapshot")}
+        if stamp not in existing:
+            return stamp
+        n = 2
+        while f"{stamp}-{n}" in existing:
+            n += 1
+        return f"{stamp}-{n}"
+
+    # ---- collector bookkeeping
+    def _collect(self, name, fn):
+        t0 = time.time()
+        try:
+            rows, degraded, message = fn()
+            status = "ok" if not degraded else "degraded"
+        except Exception as e:  # noqa: BLE001
+            rows, degraded, message, status = 0, 1, f"{type(e).__name__}: {e}", "error"
+        self.runs.append({
+            "snapshot_id": self.sid, "collector": name, "status": status,
+            "degraded": int(bool(degraded)), "duration_ms": int((time.time() - t0) * 1000),
+            "rows": rows, "message": message,
+        })
+
+    def run(self) -> str:
+        # order matters: volumes register mount points before any file is resolved
+        self._collect("host", self.c_host)
+        self._collect("volume", self.c_volumes)
+        self._collect("host_sample", self.c_host_sample)
+        self._collect("disk_io", self.c_disk_io)
+        self._collect("interface", self.c_interfaces)
+        self._collect("process", self.c_processes)
+        self._collect("process_net", self.c_process_net)
+        self._collect("socket", self.c_sockets)
+        self._collect("file", self.c_files)
+        if self.rdns:
+            self._collect("rdns", self.c_rdns)
+        if self.geo == "online":
+            self._collect("geo", self.c_geo)
+
+        finished = time.time()
+        self.s.fact("snapshot", {
+            "snapshot_id": self.sid, "host_id": self.host_id, "started_at": self.seen,
+            "finished_at": now_iso(), "duration_ms": int((finished - self.started) * 1000),
+            "tool_version": VERSION, "schema_version": SCHEMA_VERSION, "euid": os.geteuid(),
+            "privileged": int(os.geteuid() == 0), "files_mode": self.files_mode,
+            "note": self.note,
+        })
+        for r in self.runs:
+            self.s.fact("collector_run", r)
+        return self.sid
+
+    # ---- host identity
+    def c_host(self):
+        def sysctl(key):
+            rc, out = _run(["sysctl", "-n", key], 5)
+            return out.strip() if rc == 0 else ""
+        hostname = pysocket.gethostname()
+        hw_uuid = sysctl("kern.uuid")
+        self.host_id = _hid("h", hw_uuid or hostname)
+        self.s.dim("host", {
+            "host_id": self.host_id, "hostname": hostname, "hw_uuid": hw_uuid,
+            "model": sysctl("hw.product") or sysctl("hw.model"),
+            "cpu_brand": sysctl("machdep.cpu.brand_string"),
+            "ncpu": sysctl("hw.ncpu"), "mem_bytes": sysctl("hw.memsize"),
+            "os_name": platform.system(), "os_version": platform.mac_ver()[0] or "",
+            "kernel": platform.release(), "arch": platform.machine(),
+        }, self.seen)
+        return 1, 0, ""
+
+    # ---- volumes (disk usage) — also the mount table the file dimension uses
+    def c_volumes(self):
+        rc, out = _run(["df", "-k", "-l", "-i"], 20)
+        if rc != 0:
+            rc, out = _run(["df", "-k", "-i"], 20)
+        n = 0
+        for line in out.splitlines()[1:]:
+            f = line.split(None, 8)
+            if len(f) < 9:
+                continue
+            device, blocks, used, avail, cap, iused, ifree, ipct, mount = f[:9]
+            vid = _hid("v", device, mount)
+            self.s.dim("volume", {
+                "volume_id": vid, "device": device, "mount_point": mount,
+                "fs_type": self._fs_type(mount),
+            }, self.seen)
+            self.refs.register_mount(vid, mount)
+            self.s.fact("volume_sample", {
+                "snapshot_id": self.sid, "volume_id": vid,
+                "total_bytes": _num(blocks, int) * 1024 if blocks.isdigit() else "",
+                "used_bytes": _num(used, int) * 1024 if used.isdigit() else "",
+                "avail_bytes": _num(avail, int) * 1024 if avail.isdigit() else "",
+                "capacity_pct": _num(cap.rstrip("%"), int),
+                "inodes_used": _num(iused, int), "inodes_free": _num(ifree, int),
+            })
+            n += 1
+        return n, 0 if n else 1, "" if n else "df returned no rows"
+
+    _mount_types: dict[str, str] | None = None
+
+    def _fs_type(self, mount: str) -> str:
+        if Capture._mount_types is None:
+            Capture._mount_types = {}
+            rc, out = _run(["mount"], 10)
+            for line in out.splitlines():
+                m = re.match(r"^(.*?) on (.*?) \((\w+)", line)
+                if m:
+                    Capture._mount_types[m.group(2)] = m.group(3)
+        return Capture._mount_types.get(mount, "")
+
+    # ---- machine-wide cpu / ram / paging / aggregate net + disk
+    def c_host_sample(self):
+        row = {"snapshot_id": self.sid}
+        degraded, notes = 0, []
+
+        rc, out = _run(["sysctl", "-n", "vm.loadavg", "kern.boottime", "hw.pagesize"], 5)
+        parts = out.splitlines()
+        if parts:
+            m = re.findall(r"[\d.]+", parts[0])
+            if len(m) >= 3:
+                row["load1"], row["load5"], row["load15"] = (float(x) for x in m[:3])
+        if len(parts) > 1:
+            m = re.search(r"sec\s*=\s*(\d+)", parts[1])
+            if m:
+                row["uptime_s"] = int(time.time()) - int(m.group(1))
+        if len(parts) > 2:
+            row["page_size"] = _num(parts[2], int)
+
+        rc, out = _run(["vm_stat"], 10)
+        page = row.get("page_size") or 4096
+        m = re.search(r"page size of (\d+)", out)
+        if m:
+            page = int(m.group(1))
+            row["page_size"] = page
+        vm = {}
+        for line in out.splitlines():
+            k, _, v = line.partition(":")
+            v = v.strip().rstrip(".")
+            if v.isdigit():
+                vm[k.strip().lower()] = int(v)
+        for key, col in (("pages free", "mem_free_bytes"), ("pages active", "mem_active_bytes"),
+                         ("pages inactive", "mem_inactive_bytes"),
+                         ("pages speculative", "mem_speculative_bytes"),
+                         ("pages wired down", "mem_wired_bytes"),
+                         ("pages purgeable", "mem_purgeable_bytes"),
+                         ("pages occupied by compressor", "mem_compressed_bytes")):
+            if key in vm:
+                row[col] = vm[key] * page
+        for key, col in (("pageins", "pageins"), ("pageouts", "pageouts"),
+                         ("swapins", "swapins"), ("swapouts", "swapouts")):
+            if key in vm:
+                row[col] = vm[key]
+
+        rc, out = _run(["sysctl", "-n", "hw.memsize", "vm.swapusage"], 5)
+        lines = out.splitlines()
+        if lines:
+            row["mem_total_bytes"] = _num(lines[0], int)
+        if len(lines) > 1:
+            for label, col in (("total", "swap_total_bytes"), ("used", "swap_used_bytes"),
+                               ("free", "swap_free_bytes")):
+                m = re.search(rf"{label} = ([\d.]+)([BKMGT])", lines[1])
+                if m:
+                    row[col] = _bytes(m.group(1) + m.group(2))
+
+        rc, out = _run(["top", "-l", "1", "-n", "0"], 40)
+        if rc != 0:
+            degraded, notes = 1, notes + ["top unavailable: cpu%/aggregate io missing"]
+        else:
+            m = re.search(r"Processes: (\d+) total, (\d+) running, (\d+) sleeping, (\d+) threads", out)
+            if m:
+                row["procs_total"], row["procs_running"] = int(m.group(1)), int(m.group(2))
+                row["procs_sleeping"], row["threads_total"] = int(m.group(3)), int(m.group(4))
+            m = re.search(r"CPU usage: ([\d.]+)% user, ([\d.]+)% sys, ([\d.]+)% idle", out)
+            if m:
+                row["cpu_user_pct"], row["cpu_sys_pct"], row["cpu_idle_pct"] = (
+                    float(m.group(1)), float(m.group(2)), float(m.group(3)))
+            m = re.search(r"PhysMem: (\S+) used .*?, (\S+) unused", out)
+            if m:
+                row["mem_used_bytes"], row["mem_unused_bytes"] = _bytes(m.group(1)), _bytes(m.group(2))
+            m = re.search(r"Networks: packets: (\d+)/(\S+) in, (\d+)/(\S+) out", out)
+            if m:
+                row["net_pkts_in"], row["net_bytes_in"] = int(m.group(1)), _bytes(m.group(2))
+                row["net_pkts_out"], row["net_bytes_out"] = int(m.group(3)), _bytes(m.group(4))
+            m = re.search(r"Disks: (\d+)/(\S+) read, (\d+)/(\S+) written", out)
+            if m:
+                row["disk_reads"], row["disk_bytes_read"] = int(m.group(1)), _bytes(m.group(2))
+                row["disk_writes"], row["disk_bytes_written"] = int(m.group(3)), _bytes(m.group(4))
+
+        self.s.fact("host_sample", row)
+        return 1, degraded, "; ".join(notes)
+
+    # ---- per-device disk throughput
+    def c_disk_io(self):
+        rc, out = _run(["iostat", "-d", "-w", "1", "-c", "2"], 25)
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        if rc != 0 or len(lines) < 3:
+            return 0, 1, "iostat gave no interval sample"
+        devices = lines[0].split()
+        values = lines[-1].split()
+        n = 0
+        for i, dev in enumerate(devices):
+            chunk = values[i * 3:i * 3 + 3]
+            if len(chunk) < 3:
+                continue
+            did = _hid("d", dev)
+            self.s.dim("disk_device", {"device_id": did, "device_name": dev}, self.seen)
+            self.s.fact("disk_io_sample", {
+                "snapshot_id": self.sid, "device_id": did,
+                "kb_per_transfer": _num(chunk[0]), "transfers_per_s": _num(chunk[1], int),
+                "mb_per_s": _num(chunk[2]),
+            })
+            n += 1
+        return n, 0, ""
+
+    # ---- per-interface volume
+    def c_interfaces(self):
+        rc, out = _run(["netstat", "-ibn"], 20)
+        macs = {}
+        seen_iface = set()
+        n = 0
+        for line in out.splitlines()[1:]:
+            f = line.split()
+            if len(f) < 10:
+                continue
+            name, mtu, network = f[0], f[1], f[2]
+            if not network.startswith("<Link"):
+                continue
+            # <Link#n> rows carry the aggregate counters and the MAC
+            rest = f[3:]
+            mac = rest[0] if rest and re.fullmatch(r"(?:[0-9a-f]{1,2}:){5}[0-9a-f]{1,2}", rest[0]) else ""
+            nums = [x for x in rest if x.isdigit()]
+            if len(nums) < 7:
+                continue
+            if name in seen_iface:
+                continue
+            seen_iface.add(name)
+            macs[name] = mac
+            iid = _hid("i", name)
+            self.s.dim("interface", {
+                "interface_id": iid, "name": name, "mtu": mtu, "mac": mac,
+            }, self.seen)
+            ipkts, ierrs, ibytes, opkts, oerrs, obytes, coll = (int(x) for x in nums[:7])
+            self.s.fact("interface_sample", {
+                "snapshot_id": self.sid, "interface_id": iid, "ipkts": ipkts,
+                "ierrs": ierrs, "ibytes": ibytes, "opkts": opkts, "oerrs": oerrs,
+                "obytes": obytes, "collisions": coll,
+            })
+            n += 1
+        return n, 0 if n else 1, "" if n else "no <Link> rows in netstat -ibn"
+
+    # ---- processes: identity + cpu/ram, enriched from the kernel where allowed
+    def c_processes(self):
+        fields = ("pid=,ppid=,pgid=,uid=,ruser=,state=,pri=,nice=,%cpu=,%mem=,"
+                  "rss=,vsz=,etime=,time=,tty=")
+        rc, out = _run(["ps", "-Ao", fields], 30)
+        if rc != 0:
+            return 0, 1, "ps failed"
+        rc2, out2 = _run(["ps", "-Ao", "pid=,lstart="], 30)
+        starts = {}
+        for line in out2.splitlines():
+            pid_s, _, rest = line.strip().partition(" ")
+            rest = rest.strip()
+            if not pid_s.isdigit() or not rest:
+                continue
+            try:
+                dt = datetime.strptime(rest, "%a %b %d %H:%M:%S %Y").astimezone(timezone.utc)
+                starts[int(pid_s)] = dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            except ValueError:
+                pass
+        rc3, out3 = _run(["ps", "-Ao", "pid=,command="], 30)
+        argvs = {}
+        for line in out3.splitlines():
+            pid_s, _, rest = line.strip().partition(" ")
+            if pid_s.isdigit():
+                argvs[int(pid_s)] = rest.strip()
+
+        enriched = denied = n = 0
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) < 14 or not f[0].isdigit():
+                continue
+            (pid, ppid, pgid, uid, user, state, pri, nice, cpu, mem,
+             rss, vsz, etime, cputime) = f[:14]
+            tty = f[14] if len(f) > 14 else ""
+            pid_i = int(pid)
+            self.pids.add(pid_i)
+            argv = argvs.get(pid_i, "")
+            exe = self.libproc.exe_path(pid_i) or (argv.split(" ")[0] if argv.startswith("/") else "")
+            self.s.fact("process", {
+                "snapshot_id": self.sid, "pid": pid_i, "ppid": _num(ppid, int),
+                "pgid": _num(pgid, int), "uid": _num(uid, int), "username": user,
+                "command_id": self.refs.command(exe), "argv": argv,
+                "started_at": starts.get(pid_i, ""), "elapsed_s": _etime_seconds(etime),
+                "tty": tty,
+            })
+            sample = {
+                "snapshot_id": self.sid, "pid": pid_i, "state": state,
+                "priority": _num(pri, int), "nice": _num(nice, int),
+                "cpu_pct": _num(cpu), "mem_pct": _num(mem),
+                "rss_bytes": _num(rss, int) * 1024 if rss.isdigit() else "",
+                "vsz_bytes": _num(vsz, int) * 1024 if vsz.isdigit() else "",
+                "cpu_time_s": _cputime_seconds(cputime), "source": "ps",
+            }
+            ti = self.libproc.task_info(pid_i)
+            if ti:
+                sample.update(ti)
+                sample["source"] = "ps+libproc"
+                enriched += 1
+            else:
+                denied += 1
+            self.s.fact("process_sample", sample)
+            n += 1
+        msg = ""
+        if denied:
+            msg = (f"{enriched} processes carry kernel task info, {denied} do not "
+                   f"(not owned by uid {os.geteuid()}); those rows have source=ps only")
+        return n, 1 if denied else 0, msg
+
+    # ---- per-process network volume
+    def c_process_net(self):
+        rc, out = _run(["nettop", "-P", "-x", "-n", "-l", "1", "-J", "bytes_in,bytes_out"], 30)
+        if rc != 0:
+            return 0, 1, "nettop unavailable"
+        n = skipped = 0
+        for line in out.splitlines()[1:]:
+            f = line.split()
+            if len(f) < 3 or not f[-1].isdigit() or not f[-2].isdigit():
+                continue
+            name = " ".join(f[:-2])
+            _, _, pid_s = name.rpartition(".")
+            if not pid_s.isdigit():
+                continue
+            pid_i = int(pid_s)
+            if pid_i not in self.pids:
+                skipped += 1        # started/ended between collectors; a fact with no
+                continue            # parent process row would break referential integrity
+            self.s.fact("process_net_sample", {
+                "snapshot_id": self.sid, "pid": pid_i, "bytes_in": int(f[-2]),
+                "bytes_out": int(f[-1]), "source": "nettop",
+            })
+            n += 1
+        return n, 1 if skipped else 0, f"{skipped} rows dropped: pid not in this snapshot" if skipped else ""
+
+    # ---- sockets: lsof supplies who/where, netstat supplies how much
+    def c_sockets(self):
+        byte_index = self._netstat_bytes()
+        rc, out = _run(["lsof", "-nP", "-i", "-FpcfPnT"], 90)
+        if rc not in (0, 1) or not out.strip():
+            return 0, 1, "lsof -i returned nothing (sockets not observable)"
+        seq = 0
+        pid = None
+        cur: dict | None = None
+        dropped = 0
+
+        def emit(rec):
+            nonlocal seq, dropped
+            if rec is None or rec.get("pid") not in self.pids:
+                if rec is not None:
+                    dropped += 1
+                return
+            seq += 1
+            rec["snapshot_id"] = self.sid
+            rec["socket_seq"] = seq
+            # join on ports, not on the address text: lsof writes '[::1]:5000'
+            # where netstat writes '::1.5000' and truncates long v6 addresses
+            key = (rec["pid"], rec.pop("_lport", ""), rec.pop("_rport", ""))
+            b = byte_index.get(key) or byte_index.get((key[0], key[1], ""))
+            if b:
+                rec["rx_bytes"], rec["tx_bytes"] = b
+                rec["source"] = "lsof+netstat"
+            else:
+                rec["source"] = "lsof"
+            self.s.fact("socket", rec)
+
+        for line in out.splitlines():
+            if not line:
+                continue
+            tag, val = line[0], line[1:]
+            if tag == "p":
+                emit(cur)
+                cur = None
+                pid = int(val) if val.isdigit() else None
+            elif tag == "f":
+                emit(cur)
+                cur = {"pid": pid, "fd": val, "protocol": "", "state": "",
+                       "recv_q": "", "send_q": ""}
+            elif cur is None:
+                continue
+            elif tag == "P":
+                cur["protocol"] = val.lower()
+            elif tag == "n":
+                local, _, remote = val.partition("->")
+                la, lp = split_hostport(local)
+                ra, rp = split_hostport(remote)
+                cur["_lport"], cur["_rport"] = lp, rp
+                cur["local_address_id"] = self.refs.address(la)
+                cur["local_port_id"] = self.refs.port(cur.get("protocol"), lp)
+                cur["remote_address_id"] = self.refs.address(ra)
+                cur["remote_port_id"] = self.refs.port(cur.get("protocol"), rp)
+            elif tag == "T":
+                k, _, v = val.partition("=")
+                if k == "ST":
+                    cur["state"] = v
+                elif k == "QR":
+                    cur["recv_q"] = _num(v, int)
+                elif k == "QS":
+                    cur["send_q"] = _num(v, int)
+        emit(cur)
+        msg = f"{dropped} sockets dropped: owning pid not in this snapshot" if dropped else ""
+        if os.geteuid() != 0:
+            msg = (msg + "; " if msg else "") + "not root: sockets of other users are invisible"
+        return seq, 1 if (dropped or os.geteuid() != 0) else 0, msg
+
+    _NETSTAT_TAIL = re.compile(
+        r"^(?:([A-Z_]+)\s+)?(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(?:.*?):(\d+)\s")
+
+    def _netstat_bytes(self) -> dict[tuple, tuple[int, int]]:
+        """(pid, local_port, remote_port) -> (rxbytes, txbytes). netstat is the only source
+        on macOS that attributes byte counts to an individual socket."""
+        rc, out = _run(["netstat", "-anv"], 30)
+        index: dict[tuple, tuple[int, int]] = {}
+        if rc != 0:
+            return index
+        for line in out.splitlines():
+            if not re.match(r"^(tcp|udp)[46]?\s", line):
+                continue
+            head = re.match(r"^(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$", line)
+            if not head:
+                continue
+            local, remote, tail = head.group(4), head.group(5), head.group(6)
+            m = self._NETSTAT_TAIL.match(tail)
+            if not m:
+                continue
+            rx, tx, pid_s = int(m.group(2)), int(m.group(3)), m.group(6)
+            index[(int(pid_s), split_hostport(local)[1], split_hostport(remote)[1])] = (rx, tx)
+        return index
+
+    # ---- open files: the process -> file-location edge
+    def c_files(self):
+        if self.files_mode == "none":
+            return 0, 0, "skipped by --files none"
+        cmd = ["lsof", "-nP", "-Fpftan"]
+        if self.files_mode == "own":
+            cmd += ["-u", str(os.geteuid())]
+        rc, out = _run(cmd, 180)
+        if not out.strip():
+            return 0, 1, "lsof returned nothing"
+        pid = None
+        fd = fdtype = access = ""
+        n = dropped = 0
+        emitted: set[tuple] = set()
+        for line in out.splitlines():
+            if not line:
+                continue
+            tag, val = line[0], line[1:]
+            if tag == "p":
+                pid = int(val) if val.isdigit() else None
+            elif tag == "f":
+                fd, fdtype, access = val, "", ""
+            elif tag == "a":
+                access = val.strip()
+            elif tag == "t":
+                fdtype = val
+            elif tag == "n":
+                if pid is None or pid not in self.pids or not val.startswith("/"):
+                    if pid is not None and pid not in self.pids:
+                        dropped += 1
+                    continue
+                fid = self.refs.file(val)
+                key = (pid, fd, fid)
+                if key in emitted:
+                    continue
+                emitted.add(key)
+                self.s.fact("process_file", {
+                    "snapshot_id": self.sid, "pid": pid, "fd": fd, "fd_type": fdtype,
+                    "file_id": fid, "access": access,
+                })
+                n += 1
+        msg = f"{dropped} file rows dropped: owning pid not in this snapshot" if dropped else ""
+        if self.files_mode == "own":
+            msg = (msg + "; " if msg else "") + f"only uid {os.geteuid()} processes (--files all for every process)"
+        return n, 1 if (dropped or self.files_mode == "own") else 0, msg
+
+    # ---- optional enrichment: where an address actually is
+    def c_rdns(self):
+        idx = self.s.load_dim("ip_address")
+        n = 0
+        for row in idx.values():
+            if row.get("rdns") or row.get("scope") in ("wildcard", "unknown"):
+                continue
+            try:
+                row["rdns"] = pysocket.gethostbyaddr(row["address"].split("%")[0])[0]
+                n += 1
+            except (OSError, UnicodeError):
+                row["rdns"] = "-"
+        return n, 0, "reverse DNS resolved through the system resolver"
+
+    def c_geo(self):
+        """Opt-in only. Sends PUBLIC addresses (never private/loopback) to
+        ip-api.com. Off unless you pass --geo online."""
+        import urllib.request
+        idx = self.s.load_dim("ip_address")
+        todo = [r for r in idx.values()
+                if r.get("scope") == "public" and not r.get("geo_source")]
+        n = 0
+        for i in range(0, len(todo), 100):
+            batch = [r["address"].split("%")[0] for r in todo[i:i + 100]]
+            req = urllib.request.Request(
+                "http://ip-api.com/batch?fields=status,country,regionName,city,org,query",
+                data=json.dumps(batch).encode(), headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    results = json.load(resp)
+            except Exception as e:  # noqa: BLE001
+                return n, 1, f"geo lookup failed: {e}"
+            by_addr = {r.get("query"): r for r in results if isinstance(r, dict)}
+            for row in todo[i:i + 100]:
+                r = by_addr.get(row["address"].split("%")[0])
+                if not r or r.get("status") != "success":
+                    continue
+                row.update({"geo_source": "ip-api.com", "geo_country": r.get("country", ""),
+                            "geo_region": r.get("regionName", ""), "geo_city": r.get("city", ""),
+                            "geo_org": r.get("org", "")})
+                n += 1
+            time.sleep(4)   # free tier: 15 batch requests/minute
+        return n, 0, "public addresses only; private and loopback were never sent"
+
+
+# ============================================================ integrity
+def verify(store: Store) -> dict:
+    """Referential integrity, checked against the schema rather than against a
+    hand-kept list — every finding names the table, column and offending value."""
+    findings: list[dict] = []
+    data = {name: store.read(name) for name in SCHEMA}
+    counts = {k: len(v) for k, v in data.items()}
+
+    def add(kind, table, detail, sample=None):
+        findings.append({"check": kind, "table": table, "detail": detail,
+                         "sample": sample or []})
+
+    # 1. header conformance
+    for name, table in SCHEMA.items():
+        if not table.path.exists():
+            continue
+        with table.path.open(newline="", encoding="utf-8") as fh:
+            header = next(csv.reader(fh), [])
+        if header and header != table.columns:
+            add("header", name,
+                f"columns differ from schema v{SCHEMA_VERSION}",
+                [{"on_disk": header, "expected": table.columns}])
+
+    # 2. primary keys unique and populated
+    for name, table in SCHEMA.items():
+        seen, dupes, blanks = set(), [], 0
+        for row in data[name]:
+            key = tuple(row.get(c, "") for c in table.pk)
+            if any(v == "" for v in key):
+                blanks += 1
+            elif key in seen:
+                if len(dupes) < 5:
+                    dupes.append(dict(zip(table.pk, key)))
+            else:
+                seen.add(key)
+        if dupes:
+            add("pk_duplicate", name, f"{len(dupes)}+ duplicate keys on {'+'.join(table.pk)}", dupes)
+        if blanks:
+            add("pk_blank", name, f"{blanks} rows with an empty primary key component")
+
+    # 3. declared foreign keys resolve
+    key_sets = {name: {tuple(r.get(c, "") for c in SCHEMA[name].pk) for r in data[name]}
+                for name in SCHEMA}
+    single_key = {name: {r.get(SCHEMA[name].pk[0], "") for r in data[name]} for name in SCHEMA}
+    for name, table in SCHEMA.items():
+        for col, target in table.fks.items():
+            if target is None:
+                continue
+            tgt_table, tgt_col = target
+            valid = single_key[tgt_table]
+            bad = []
+            for row in data[name]:
+                v = row.get(col, "")
+                if v == "":
+                    continue            # optional reference (e.g. a listener has no peer)
+                if v not in valid:
+                    if len(bad) < 5:
+                        bad.append({col: v, **{c: row.get(c) for c in table.pk}})
+            if bad:
+                add("fk_dangling", name,
+                    f"{col} -> {tgt_table}.{tgt_col} does not resolve", bad)
+
+    # 4. composite parents (a per-process fact must have its process row)
+    proc_keys = {(r["snapshot_id"], r["pid"]) for r in data["process"]}
+    for name, (parent, cols) in FACT_PARENT.items():
+        bad = []
+        for row in data[name]:
+            key = tuple(row.get(c, "") for c in cols)
+            if key not in proc_keys and len(bad) < 5:
+                bad.append(dict(zip(cols, key)))
+        if bad:
+            add("orphan_fact", name, f"rows with no matching {parent} row in the same snapshot", bad)
+
+    # 5. self-reference: ppid within the snapshot (a warning, not a defect — the
+    #    parent may legitimately have exited between the two ps calls)
+    dangling_ppid = 0
+    for row in data["process"]:
+        ppid = row.get("ppid", "")
+        if ppid in ("", "0"):
+            continue
+        if (row["snapshot_id"], ppid) not in proc_keys:
+            dangling_ppid += 1
+    if dangling_ppid:
+        add("note_ppid", "process",
+            f"{dangling_ppid} rows name a ppid absent from their snapshot (parent exited mid-capture)")
+
+    # 6. dimension lifetimes make sense
+    for name, table in SCHEMA.items():
+        if table.kind != "dim":
+            continue
+        bad = [r[table.pk[0]] for r in data[name]
+               if r.get("first_seen") and r.get("last_seen") and r["last_seen"] < r["first_seen"]]
+        if bad:
+            add("dim_lifetime", name, f"{len(bad)} rows where last_seen precedes first_seen", bad[:5])
+
+    # 7. every snapshot is complete enough to be usable
+    snap_ids = single_key["snapshot"]
+    for required in ("host_sample", "process"):
+        have = {r["snapshot_id"] for r in data[required]}
+        missing = sorted(snap_ids - have)
+        if missing:
+            add("incomplete_snapshot", required,
+                f"{len(missing)} snapshots have no {required} rows", missing[:5])
+
+    errors = [f for f in findings if not f["check"].startswith("note_")]
+    return {
+        "root": str(store.root), "schema_version": SCHEMA_VERSION,
+        "tables": counts, "rows": sum(counts.values()),
+        "findings": findings, "ok": not errors,
+    }
+
+
+# ============================================================ SQLite mirror
+SQL_TYPES = {"pid", "ppid", "pgid", "uid", "port", "ncpu", "fd"}
+
+
+def ddl() -> str:
+    """The same schema, expressed where the database itself will enforce it."""
+    out = ["PRAGMA foreign_keys = ON;"]
+    order = [n for n, t in SCHEMA.items() if t.kind == "dim"] + \
+            [n for n, t in SCHEMA.items() if t.kind == "fact"]
+    # snapshot must exist before the facts that point at it
+    order = ["snapshot"] + [n for n in order if n != "snapshot"]
+    order = [n for n in order if SCHEMA[n].kind == "dim"] + \
+            ["snapshot"] + [n for n in order if SCHEMA[n].kind == "fact" and n != "snapshot"]
+    for name in dict.fromkeys(order):
+        t = SCHEMA[name]
+        cols = []
+        for c in t.columns:
+            typ = "INTEGER" if c in SQL_TYPES else "TEXT"
+            cols.append(f"  {c} {typ}")
+        cols.append(f"  PRIMARY KEY ({', '.join(t.pk)})")
+        for col, target in t.fks.items():
+            if target:
+                cols.append(f"  FOREIGN KEY ({col}) REFERENCES {target[0]}({target[1]})")
+        if name in FACT_PARENT:
+            parent, pcols = FACT_PARENT[name]
+            cols.append(f"  FOREIGN KEY ({', '.join(pcols)}) REFERENCES {parent}({', '.join(pcols)})")
+        out.append(f"CREATE TABLE IF NOT EXISTS {name} (\n" + ",\n".join(cols) + "\n);")
+    out += [
+        "CREATE INDEX IF NOT EXISTS ix_process_snapshot ON process(snapshot_id);",
+        "CREATE INDEX IF NOT EXISTS ix_socket_snapshot ON socket(snapshot_id);",
+        "CREATE INDEX IF NOT EXISTS ix_process_file_file ON process_file(file_id);",
+        "CREATE INDEX IF NOT EXISTS ix_socket_remote ON socket(remote_address_id);",
+        """CREATE VIEW IF NOT EXISTS v_process AS
+SELECT p.snapshot_id, p.pid, p.ppid, p.username, c.basename AS command,
+       p.argv, s.cpu_pct, s.mem_pct, s.rss_bytes, s.threads, s.state,
+       n.bytes_in, n.bytes_out
+FROM process p
+LEFT JOIN command c ON c.command_id = p.command_id
+LEFT JOIN process_sample s ON s.snapshot_id = p.snapshot_id AND s.pid = p.pid
+LEFT JOIN process_net_sample n ON n.snapshot_id = p.snapshot_id AND n.pid = p.pid;""",
+        """CREATE VIEW IF NOT EXISTS v_connection AS
+SELECT k.snapshot_id, k.pid, c.basename AS command, k.protocol, k.state,
+       la.address AS local_address, lp.port AS local_port, lp.service_name AS local_service,
+       ra.address AS remote_address, rp.port AS remote_port, rp.service_name AS remote_service,
+       ra.scope AS remote_scope, ra.rdns AS remote_rdns, ra.geo_country, ra.geo_city,
+       k.rx_bytes, k.tx_bytes
+FROM socket k
+LEFT JOIN process p ON p.snapshot_id = k.snapshot_id AND p.pid = k.pid
+LEFT JOIN command c ON c.command_id = p.command_id
+LEFT JOIN ip_address la ON la.address_id = k.local_address_id
+LEFT JOIN ip_address ra ON ra.address_id = k.remote_address_id
+LEFT JOIN port lp ON lp.port_id = k.local_port_id
+LEFT JOIN port rp ON rp.port_id = k.remote_port_id;""",
+        """CREATE VIEW IF NOT EXISTS v_open_file AS
+SELECT pf.snapshot_id, pf.pid, c.basename AS command, pf.fd, pf.fd_type, pf.access,
+       f.path, f.directory, f.basename AS filename, f.extension, v.mount_point
+FROM process_file pf
+LEFT JOIN file f ON f.file_id = pf.file_id
+LEFT JOIN volume v ON v.volume_id = f.volume_id
+LEFT JOIN process p ON p.snapshot_id = pf.snapshot_id AND p.pid = pf.pid
+LEFT JOIN command c ON c.command_id = p.command_id;""",
+    ]
+    return "\n".join(out)
+
+
+def build_db(store: Store, rebuild=False) -> dict:
+    path = store.root / "sysobs.sqlite"
+    if rebuild and path.exists():
+        path.unlink()
+    con = sqlite3.connect(path)
+    con.executescript(ddl())
+    loaded, skipped = {}, {}
+    order = [n for n, t in SCHEMA.items() if t.kind == "dim" and n not in ("file", "command")]
+    order += ["volume", "file", "command", "snapshot"]
+    order += [n for n, t in SCHEMA.items() if t.kind == "fact" and n != "snapshot"]
+    for name in dict.fromkeys(order):
+        t = SCHEMA[name]
+        rows = store.read(name)
+        if not rows:
+            continue
+        cols = ",".join(t.columns)
+        marks = ",".join("?" * len(t.columns))
+        payload = [tuple(r.get(c, "") or None for c in t.columns) for r in rows]
+        try:
+            con.executemany(f"INSERT OR REPLACE INTO {name} ({cols}) VALUES ({marks})", payload)
+            loaded[name] = len(payload)
+        except sqlite3.IntegrityError as e:
+            skipped[name] = str(e)
+    con.commit()
+    violations = [dict(zip(("table", "rowid", "parent", "fkid"), r))
+                  for r in con.execute("PRAGMA foreign_key_check").fetchall()]
+    con.close()
+    return {"db": str(path), "loaded": loaded, "rejected": skipped,
+            "foreign_key_violations": violations,
+            "ok": not skipped and not violations}
+
+
+# ============================================================ reading commands
+def human(n) -> str:
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "K", "M", "G", "T", "P"):
+        if abs(n) < 1024 or unit == "P":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+
+def resolve_snapshot(store: Store, ref: str) -> str | None:
+    snaps = [r["snapshot_id"] for r in store.read("snapshot")]
+    if not snaps:
+        return None
+    if ref in ("latest", "", None):
+        return sorted(snaps)[-1]
+    if ref in snaps:
+        return ref
+    matches = [s for s in snaps if s.startswith(ref) or ref in s]
+    return matches[-1] if matches else None
+
+
+def cmd_list(store: Store, as_json: bool) -> int:
+    snaps = store.read("snapshot")
+    runs = store.read("collector_run")
+    by_snap: dict[str, list] = {}
+    for r in runs:
+        by_snap.setdefault(r["snapshot_id"], []).append(r)
+    procs: dict[str, int] = {}
+    for r in store.read("process"):
+        procs[r["snapshot_id"]] = procs.get(r["snapshot_id"], 0) + 1
+    socks: dict[str, int] = {}
+    for r in store.read("socket"):
+        socks[r["snapshot_id"]] = socks.get(r["snapshot_id"], 0) + 1
+    out = []
+    for s in sorted(snaps, key=lambda r: r["snapshot_id"]):
+        sid = s["snapshot_id"]
+        degraded = [r["collector"] for r in by_snap.get(sid, []) if r["degraded"] == "1"]
+        errored = [r["collector"] for r in by_snap.get(sid, []) if r["status"] == "error"]
+        out.append({"snapshot_id": sid, "started_at": s["started_at"],
+                    "duration_ms": _num(s["duration_ms"], int),
+                    "processes": procs.get(sid, 0), "sockets": socks.get(sid, 0),
+                    "files_mode": s["files_mode"], "degraded": degraded, "errors": errored})
+    if as_json:
+        print(json.dumps(out, indent=2))
+        return 0
+    if not out:
+        print("no snapshots yet — run: sysobs snapshot")
+        return 0
+    print(f"{'SNAPSHOT':<26} {'STARTED':<21} {'MS':>6} {'PROCS':>6} {'SOCKS':>6}  NOTES")
+    for r in out:
+        notes = []
+        if r["errors"]:
+            notes.append("error:" + ",".join(r["errors"]))
+        elif r["degraded"]:
+            notes.append("degraded:" + ",".join(r["degraded"]))
+        print(f"{r['snapshot_id']:<26} {r['started_at']:<21} {r['duration_ms']:>6} "
+              f"{r['processes']:>6} {r['sockets']:>6}  {' '.join(notes)}")
+    return 0
+
+
+def cmd_show(store: Store, ref: str, as_json: bool) -> int:
+    sid = resolve_snapshot(store, ref)
+    if not sid:
+        print(f"no snapshot matching {ref!r}", file=sys.stderr)
+        return 1
+    snap = next(r for r in store.read("snapshot") if r["snapshot_id"] == sid)
+    hosts = {r["host_id"]: r for r in store.read("host")}
+    hs = next((r for r in store.read("host_sample") if r["snapshot_id"] == sid), {})
+    runs = [r for r in store.read("collector_run") if r["snapshot_id"] == sid]
+    per_table = {}
+    for name, t in SCHEMA.items():
+        if t.kind == "fact" and "snapshot_id" in t.columns:
+            per_table[name] = sum(1 for r in store.read(name) if r["snapshot_id"] == sid)
+    vols = [r for r in store.read("volume_sample") if r["snapshot_id"] == sid]
+    volumes = {r["volume_id"]: r for r in store.read("volume")}
+    payload = {"snapshot": snap, "host": hosts.get(snap["host_id"], {}),
+               "host_sample": hs, "collectors": runs, "row_counts": per_table,
+               "volumes": [{"mount": volumes.get(v["volume_id"], {}).get("mount_point", "?"),
+                            "used_bytes": v["used_bytes"], "avail_bytes": v["avail_bytes"],
+                            "capacity_pct": v["capacity_pct"]} for v in vols]}
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    h = payload["host"]
+    print(f"{sid}   {snap['started_at']}   {snap['duration_ms']}ms   v{snap['tool_version']}")
+    print(f"host    {h.get('hostname','?')}  {h.get('model','')}  {h.get('cpu_brand','')}  "
+          f"{h.get('ncpu','?')} cpu  {human(h.get('mem_bytes'))} ram  "
+          f"{h.get('os_name','')} {h.get('os_version','')}")
+    print(f"load    {hs.get('load1','?')} {hs.get('load5','?')} {hs.get('load15','?')}   "
+          f"cpu {hs.get('cpu_user_pct','?')}% user / {hs.get('cpu_sys_pct','?')}% sys / "
+          f"{hs.get('cpu_idle_pct','?')}% idle   up {_num(hs.get('uptime_s'), int) or 0}s")
+    print(f"memory  {human(hs.get('mem_used_bytes'))} used  {human(hs.get('mem_wired_bytes'))} wired  "
+          f"{human(hs.get('mem_compressed_bytes'))} compressed  {human(hs.get('mem_free_bytes'))} free  "
+          f"swap {human(hs.get('swap_used_bytes'))}/{human(hs.get('swap_total_bytes'))}")
+    print(f"network {human(hs.get('net_bytes_in'))} in / {human(hs.get('net_bytes_out'))} out   "
+          f"disk {human(hs.get('disk_bytes_read'))} read / {human(hs.get('disk_bytes_written'))} written")
+    print("\nrows")
+    for k, v in sorted(per_table.items(), key=lambda kv: -kv[1]):
+        if v:
+            print(f"  {k:<22} {v:>8}")
+    print("\ncollectors")
+    for r in runs:
+        flag = {"ok": "ok", "degraded": "~", "error": "!!"}.get(r["status"], "?")
+        print(f"  {flag:<3} {r['collector']:<14} {r['duration_ms']:>6}ms {r['rows']:>7} rows"
+              f"  {r['message']}")
+    big = sorted(payload["volumes"], key=lambda v: -(_num(v["used_bytes"], int) or 0))[:6]
+    print("\nvolumes")
+    for v in big:
+        print(f"  {v['mount']:<34} {human(v['used_bytes']):>8} used  "
+              f"{human(v['avail_bytes']):>8} free  {v['capacity_pct']}%")
+    return 0
+
+
+def cmd_top(store: Store, ref: str, by: str, limit: int, as_json: bool) -> int:
+    sid = resolve_snapshot(store, ref)
+    if not sid:
+        print(f"no snapshot matching {ref!r}", file=sys.stderr)
+        return 1
+    cmds = {r["command_id"]: r for r in store.read("command")}
+    procs = {r["pid"]: r for r in store.read("process") if r["snapshot_id"] == sid}
+    samples = {r["pid"]: r for r in store.read("process_sample") if r["snapshot_id"] == sid}
+    nets = {r["pid"]: r for r in store.read("process_net_sample") if r["snapshot_id"] == sid}
+    files, sockets = {}, {}
+    for r in store.read("process_file"):
+        if r["snapshot_id"] == sid:
+            files[r["pid"]] = files.get(r["pid"], 0) + 1
+    for r in store.read("socket"):
+        if r["snapshot_id"] == sid:
+            sockets[r["pid"]] = sockets.get(r["pid"], 0) + 1
+    rows = []
+    for pid, p in procs.items():
+        s = samples.get(pid, {})
+        n = nets.get(pid, {})
+        rows.append({
+            "pid": _num(pid, int), "user": p["username"],
+            "command": cmds.get(p["command_id"], {}).get("basename") or p["argv"][:40],
+            "cpu_pct": _num(s.get("cpu_pct")) or 0.0, "mem_pct": _num(s.get("mem_pct")) or 0.0,
+            "rss_bytes": _num(s.get("rss_bytes"), int) or 0,
+            "threads": _num(s.get("threads"), int) or "",
+            "net_bytes": (_num(n.get("bytes_in"), int) or 0) + (_num(n.get("bytes_out"), int) or 0),
+            "files": files.get(pid, 0), "sockets": sockets.get(pid, 0),
+        })
+    keymap = {"cpu": "cpu_pct", "rss": "rss_bytes", "mem": "rss_bytes",
+              "net": "net_bytes", "files": "files", "sockets": "sockets"}
+    rows.sort(key=lambda r: r[keymap.get(by, "cpu_pct")], reverse=True)
+    rows = rows[:limit]
+    if as_json:
+        print(json.dumps({"snapshot_id": sid, "by": by, "rows": rows}, indent=2))
+        return 0
+    print(f"{sid}  by {by}")
+    print(f"{'PID':>7} {'USER':<12} {'CPU%':>6} {'RSS':>8} {'THR':>5} {'NET':>9} "
+          f"{'FILES':>6} {'SOCK':>5}  COMMAND")
+    for r in rows:
+        print(f"{r['pid']:>7} {r['user'][:12]:<12} {r['cpu_pct']:>6.1f} "
+              f"{human(r['rss_bytes']):>8} {str(r['threads']):>5} {human(r['net_bytes']):>9} "
+              f"{r['files']:>6} {r['sockets']:>5}  {r['command']}")
+    return 0
+
+
+def cmd_prune(store: Store, days: int, go: bool, as_json: bool) -> int:
+    cutoff = time.time() - days * 86400
+    keep, drop = [], []
+    for r in store.read("snapshot"):
+        try:
+            ts = datetime.strptime(r["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            ts = time.time()
+        (drop if ts < cutoff else keep).append(r["snapshot_id"])
+    plan = {"root": str(store.root), "days": days, "keep": len(keep),
+            "drop": drop, "applied": False}
+    if go and drop:
+        dropset = set(drop)
+        for name, t in SCHEMA.items():
+            if t.kind != "fact" or "snapshot_id" not in t.columns:
+                continue
+            rows = [r for r in store.read(name) if r["snapshot_id"] not in dropset]
+            store.replace(name, rows)
+        # dimensions are deliberately kept: they are the shared vocabulary the
+        # surviving snapshots still reference. Only ones nothing points at go.
+        removed = _gc_dimensions(store)
+        plan["applied"] = True
+        plan["dimensions_removed"] = removed
+    if as_json:
+        print(json.dumps(plan, indent=2))
+    else:
+        print(f"{len(drop)} snapshot(s) older than {days}d, {len(keep)} kept"
+              + ("" if go else "  (dry run — add --go)"))
+        if plan.get("dimensions_removed"):
+            print("unreferenced dimension rows removed: "
+                  + ", ".join(f"{k}={v}" for k, v in plan["dimensions_removed"].items() if v))
+    return 0
+
+
+def _gc_dimensions(store: Store) -> dict[str, int]:
+    """Drop dimension rows nothing references any more — in dependency order, so
+    the store never passes through a state where a reference dangles."""
+    removed = {}
+    referrers: dict[str, list[tuple[str, str]]] = {}
+    for name, t in SCHEMA.items():
+        for col, target in t.fks.items():
+            if target:
+                referrers.setdefault(target[0], []).append((name, col))
+    for dim in ("command", "file", "ip_address", "port", "volume", "disk_device",
+                "interface", "host"):
+        used = set()
+        for tname, col in referrers.get(dim, []):
+            used |= {r.get(col, "") for r in store.read(tname)}
+        rows = store.read(dim)
+        kept = [r for r in rows if r[SCHEMA[dim].pk[0]] in used]
+        if len(kept) != len(rows):
+            store.replace(dim, kept)
+            removed[dim] = len(rows) - len(kept)
+    return removed
+
+
+# ============================================================ selftest
+def selftest() -> int:
+    """Behaviour fixtures for the parts that parse someone else's output format —
+    the places this tool breaks quietly when macOS changes its mind."""
+    import tempfile
+    fails: list[str] = []
+
+    def check(label, got, want):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    check("etime days", _etime_seconds("04-20:16:43"), 4 * 86400 + 20 * 3600 + 16 * 60 + 43)
+    check("etime hours", _etime_seconds("01:02:03"), 3723)
+    check("etime mmss", _etime_seconds("07:15"), 435)
+    check("etime junk", _etime_seconds("-"), "")
+    check("cputime", _cputime_seconds("65:55.92"), 3955.92)
+    check("bytes G", _bytes("8698M"), 8698 * 1024 ** 2)
+    check("bytes T", _bytes("504T"), 504 * 1024 ** 4)
+    check("bytes plain", _bytes("1024"), 1024)
+
+    check("hostport v4", split_hostport("127.0.0.1:48793"), ("127.0.0.1", "48793"))
+    check("hostport wildcard", split_hostport("*:49152"), ("", "49152"))
+    check("hostport v6 lsof", split_hostport("[fe80::1]:5000"), ("fe80::1", "5000"))
+    check("hostport v6 netstat", split_hostport("2607:fb91:4100:d.54272"),
+          ("2607:fb91:4100:d", "54272"))
+    check("hostport empty", split_hostport("*.*"), ("", ""))
+    check("hostport bare v4", split_hostport("192.168.1.10"), ("192.168.1.10", ""))
+    check("hostport bare v6", split_hostport("fe80::1"), ("fe80::1", ""))
+    check("hostport udp wildcard", split_hostport("*.53"), ("", "53"))
+
+    check("scope loopback", classify_address("127.0.0.1")[1], "loopback")
+    check("scope private", classify_address("192.168.1.10")[1], "private")
+    check("scope cgnat", classify_address("100.70.1.1")[1], "cgnat")
+    check("scope public", classify_address("1.1.1.1")[1], "public")
+    check("scope public local flag", classify_address("1.1.1.1")[2], "0")
+    check("scope v6 ll", classify_address("fe80::1%en0")[1], "link-local")
+    check("scope family", classify_address("::1")[0], "ipv6")
+
+    tail = Capture._NETSTAT_TAIL.match(
+        "LISTEN                 0            0  131072  131072       python3.12:83615  00100 ")
+    check("netstat tail pid", tail.group(6) if tail else None, "83615")
+    tail2 = Capture._NETSTAT_TAIL.match(
+        "ESTABLISHED      1363008         3261  937176  132104 Google Chrome He:94117  00102 ")
+    check("netstat name with spaces", tail2.group(6) if tail2 else None, "94117")
+    check("netstat rx", int(tail2.group(2)) if tail2 else None, 1363008)
+
+    # round trip: write a tiny store, break one reference, confirm verify sees it
+    with tempfile.TemporaryDirectory() as tmp:
+        global TABLES
+        st = Store(Path(tmp))
+        saved_tables = TABLES
+        TABLES = st.tables
+        try:
+            st.dim("volume", {"volume_id": "v_x", "device": "/dev/disk1",
+                              "mount_point": "/", "fs_type": "apfs"}, "2026-01-01T00:00:00Z")
+            refs = Refs(st, "2026-01-01T00:00:00Z")
+            refs.register_mount("v_x", "/")
+            fid = refs.file("/usr/bin/true")
+            check("file volume bound", st.load_dim("file")[fid]["volume_id"], "v_x")
+            check("file id stable", fid, refs.file("/usr/bin/true"))
+            cid = refs.command("/usr/bin/true")
+            st.fact("snapshot", {"snapshot_id": "s_1", "host_id": "", "started_at": "x",
+                                 "files_mode": "own"})
+            st.fact("process", {"snapshot_id": "s_1", "pid": 1, "command_id": cid,
+                                "ppid": 0, "argv": "true"})
+            st.fact("process_sample", {"snapshot_id": "s_1", "pid": 1, "cpu_pct": 0})
+            st.fact("host_sample", {"snapshot_id": "s_1"})
+            st.fact("process_file", {"snapshot_id": "s_1", "pid": 1, "fd": "txt",
+                                     "file_id": fid})
+            st.flush()
+            clean = verify(Store(Path(tmp)))
+            check("clean store verifies", clean["ok"], True)
+
+            st2 = Store(Path(tmp))
+            rows = st2.read("process_file")
+            rows.append({"snapshot_id": "s_1", "pid": 1, "fd": "9",
+                         "file_id": "f_doesnotexist", "fd_type": "REG", "access": "r"})
+            st2.replace("process_file", rows)
+            broken = verify(Store(Path(tmp)))
+            check("dangling fk detected", broken["ok"], False)
+            check("dangling fk named",
+                  any(f["check"] == "fk_dangling" and f["table"] == "process_file"
+                      for f in broken["findings"]), True)
+
+            st3 = Store(Path(tmp))
+            rows = st3.read("process_file")
+            rows[-1]["file_id"] = fid
+            rows[-1]["pid"] = 999
+            st3.replace("process_file", rows)
+            orphan = verify(Store(Path(tmp)))
+            check("orphan fact detected",
+                  any(f["check"] == "orphan_fact" for f in orphan["findings"]), True)
+
+            st4 = Store(Path(tmp))
+            rows = st4.read("process_file")
+            rows[-1]["pid"] = 1
+            st4.replace("process_file", rows)
+            db = build_db(Store(Path(tmp)))
+            check("sqlite accepts the store", db["ok"], True)
+            check("sqlite has no fk violations", db["foreign_key_violations"], [])
+        finally:
+            TABLES = saved_tables
+
+    for line in fails:
+        print(f"FAIL {line}")
+    total = 33
+    print(f"{total - len(fails)}/{total} checks passed" if not fails
+          else f"{len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+# ============================================================ cli
+def cmd_snapshot(args) -> int:
+    store = Store()
+    cap = Capture(store, files_mode=args.files, rdns=args.rdns, geo=args.geo,
+                  note=args.note or "")
+    sid = cap.run()
+    written = store.flush()
+    result = {"snapshot_id": sid, "root": str(store.root), "written": written,
+              "collectors": cap.runs}
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"{sid}  ->  {store.tables}")
+        for name in sorted(written):
+            print(f"  {name:<22} {written[name]:>8} rows")
+        degraded = [r for r in cap.runs if r["degraded"] == 1 or r["status"] != "ok"]
+        for r in degraded:
+            print(f"  ~ {r['collector']}: {r['message']}")
+    return 0
+
+
+def cmd_watch(args) -> int:
+    n = 0
+    while args.count == 0 or n < args.count:
+        rc = cmd_snapshot(args)
+        if rc:
+            return rc
+        n += 1
+        if args.count and n >= args.count:
+            break
+        time.sleep(args.interval)
+    return 0
+
+
+def cmd_verify(args) -> int:
+    report = verify(Store())
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"{report['root']}   schema v{report['schema_version']}   "
+              f"{report['rows']} rows across {sum(1 for v in report['tables'].values() if v)} tables")
+        for name, count in sorted(report["tables"].items(), key=lambda kv: -kv[1]):
+            if count:
+                print(f"  {name:<22} {count:>9}")
+        if not report["findings"]:
+            print("\nreferential integrity: clean")
+        else:
+            print("")
+            for f in report["findings"]:
+                mark = "note" if f["check"].startswith("note_") else "FAIL"
+                print(f"  {mark} [{f['check']}] {f['table']}: {f['detail']}")
+                for s in f["sample"][:3]:
+                    print(f"       {s}")
+    return 0 if report["ok"] else 1
+
+
+def cmd_db(args) -> int:
+    report = build_db(Store(), rebuild=args.rebuild)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(report["db"])
+        for name, n in sorted(report["loaded"].items(), key=lambda kv: -kv[1]):
+            print(f"  {name:<22} {n:>9}")
+        if report["rejected"]:
+            for name, err in report["rejected"].items():
+                print(f"  REJECTED {name}: {err}")
+        if report["foreign_key_violations"]:
+            print(f"  {len(report['foreign_key_violations'])} foreign key violations")
+        if report["ok"]:
+            print("\nforeign keys enforced by sqlite: clean")
+    return 0 if report["ok"] else 1
+
+
+def cmd_query(args) -> int:
+    path = ROOT / "sysobs.sqlite"
+    if not path.exists():
+        print("no database yet — run: sysobs db", file=sys.stderr)
+        return 1
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(args.sql).fetchall()
+    except sqlite3.Error as e:
+        print(f"sql error: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2))
+        return 0
+    if not rows:
+        print("(no rows)")
+        return 0
+    cols = rows[0].keys()
+    widths = [max(len(c), max((len(str(r[c])) for r in rows), default=0)) for c in cols]
+    widths = [min(w, 48) for w in widths]
+    print("  ".join(c[:w].ljust(w) for c, w in zip(cols, widths)))
+    print("  ".join("-" * w for w in widths))
+    for r in rows:
+        print("  ".join(str(r[c])[:w].ljust(w) for c, w in zip(cols, widths)))
+    return 0
+
+
+def cmd_schema(args) -> int:
+    if args.ddl:
+        print(ddl())
+        return 0
+    payload = {name: {"kind": t.kind, "primary_key": t.pk, "columns": t.columns,
+                      "references": {c: list(v) for c, v in t.fks.items() if v},
+                      "parent": list(FACT_PARENT[name]) if name in FACT_PARENT else None,
+                      "doc": t.doc}
+               for name, t in SCHEMA.items()}
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    for name, t in SCHEMA.items():
+        print(f"{name}  [{t.kind}]  pk({', '.join(t.pk)})")
+        if t.doc:
+            print(f"    {t.doc}")
+        for col, target in t.fks.items():
+            if target:
+                print(f"    {col} -> {target[0]}.{target[1]}")
+        if name in FACT_PARENT:
+            parent, cols = FACT_PARENT[name]
+            print(f"    ({', '.join(cols)}) -> {parent}")
+        print(f"    {len(t.columns)} columns: {', '.join(t.columns)}")
+        print("")
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="sysobs", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"sysobs {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    def common(sp):
+        sp.add_argument("--json", action="store_true")
+        return sp
+
+    sp = common(sub.add_parser("snapshot", help="capture one snapshot"))
+    sp.add_argument("--files", choices=("none", "own", "all"), default="own",
+                    help="which processes to enumerate open files for (default: own)")
+    sp.add_argument("--rdns", action="store_true", help="resolve addresses to names")
+    sp.add_argument("--geo", choices=("off", "online"), default="off",
+                    help="online sends PUBLIC addresses to ip-api.com; off by default")
+    sp.add_argument("--note", default="", help="free text stored with the snapshot")
+    sp.set_defaults(fn=cmd_snapshot)
+
+    sp = common(sub.add_parser("watch", help="repeat snapshots on an interval"))
+    sp.add_argument("--interval", type=int, default=60)
+    sp.add_argument("--count", type=int, default=0, help="0 = until interrupted")
+    sp.add_argument("--files", choices=("none", "own", "all"), default="own")
+    sp.add_argument("--rdns", action="store_true")
+    sp.add_argument("--geo", choices=("off", "online"), default="off")
+    sp.add_argument("--note", default="")
+    sp.set_defaults(fn=cmd_watch)
+
+    sp = common(sub.add_parser("list", help="snapshots on record"))
+    sp.set_defaults(fn=lambda a: cmd_list(Store(), a.json))
+
+    sp = common(sub.add_parser("show", help="one snapshot in full"))
+    sp.add_argument("snapshot", nargs="?", default="latest")
+    sp.set_defaults(fn=lambda a: cmd_show(Store(), a.snapshot, a.json))
+
+    sp = common(sub.add_parser("top", help="heaviest processes in a snapshot"))
+    sp.add_argument("snapshot", nargs="?", default="latest")
+    sp.add_argument("--by", choices=("cpu", "rss", "mem", "net", "files", "sockets"),
+                    default="cpu")
+    sp.add_argument("-n", "--limit", type=int, default=20)
+    sp.set_defaults(fn=lambda a: cmd_top(Store(), a.snapshot, a.by, a.limit, a.json))
+
+    sp = common(sub.add_parser("verify", help="referential integrity report"))
+    sp.set_defaults(fn=cmd_verify)
+
+    sp = common(sub.add_parser("db", help="build the SQLite mirror"))
+    sp.add_argument("--rebuild", action="store_true")
+    sp.set_defaults(fn=cmd_db)
+
+    sp = common(sub.add_parser("query", help="SQL against the mirror"))
+    sp.add_argument("sql")
+    sp.set_defaults(fn=cmd_query)
+
+    sp = common(sub.add_parser("schema", help="tables, keys and references"))
+    sp.add_argument("--ddl", action="store_true")
+    sp.set_defaults(fn=cmd_schema)
+
+    sp = common(sub.add_parser("prune", help="drop old snapshots"))
+    sp.add_argument("--days", type=int, required=True)
+    sp.add_argument("--go", action="store_true", help="apply (default is a dry run)")
+    sp.set_defaults(fn=lambda a: cmd_prune(Store(), a.days, a.go, a.json))
+
+    sp = sub.add_parser("selftest", help="behaviour fixtures")
+    sp.set_defaults(fn=lambda a: selftest())
+
+    args = p.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        p.print_help()
+        return 2
+    try:
+        return args.fn(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
