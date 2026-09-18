@@ -1247,7 +1247,33 @@ def verify(store: Store) -> dict:
 
 
 # ============================================================ SQLite mirror
-SQL_TYPES = {"pid", "ppid", "pgid", "uid", "port", "ncpu", "fd"}
+# Column affinity is not cosmetic: with everything TEXT, MIN/MAX and ORDER BY
+# compare lexicographically, so a process up 9 seconds sorts above one up
+# 43,000 seconds and "oldest" means "starts with the biggest digit".
+REAL_COLS = {
+    "load1", "load5", "load15", "cpu_user_pct", "cpu_sys_pct", "cpu_idle_pct",
+    "cpu_pct", "mem_pct", "cpu_time_s", "user_time_s", "system_time_s",
+    "kb_per_transfer", "mb_per_s",
+}
+INT_COLS = {
+    "pid", "ppid", "pgid", "uid", "euid", "port", "ncpu", "threads", "faults",
+    "pageins", "pageouts", "cow_faults", "csw", "syscalls_mach", "syscalls_unix",
+    "messages_sent", "messages_received", "ipkts", "ierrs", "ibytes", "opkts",
+    "oerrs", "obytes", "collisions", "inodes_used", "inodes_free", "rows",
+    "degraded", "privileged", "schema_version", "socket_seq", "procs_total",
+    "procs_running", "procs_sleeping", "threads_total", "page_size", "swapins",
+    "swapouts", "net_pkts_in", "net_pkts_out", "disk_reads", "disk_writes",
+    "priority", "nice", "mtu", "transfers_per_s", "capacity_pct", "recv_q",
+    "send_q", "duration_ms", "rx_bytes", "tx_bytes", "bytes_in", "bytes_out",
+}
+
+
+def sql_type(col: str) -> str:
+    if col in REAL_COLS:
+        return "REAL"
+    if col in INT_COLS or col.endswith(("_bytes", "_s", "_ms")):
+        return "INTEGER"
+    return "TEXT"          # fd stays TEXT on purpose: 'cwd' and 'txt' are valid fds
 
 
 def ddl() -> str:
@@ -1263,8 +1289,7 @@ def ddl() -> str:
         t = SCHEMA[name]
         cols = []
         for c in t.columns:
-            typ = "INTEGER" if c in SQL_TYPES else "TEXT"
-            cols.append(f"  {c} {typ}")
+            cols.append(f"  {c} {sql_type(c)}")
         cols.append(f"  PRIMARY KEY ({', '.join(t.pk)})")
         for col, target in t.fks.items():
             if target:
@@ -1311,6 +1336,16 @@ LEFT JOIN command c ON c.command_id = p.command_id;""",
     return "\n".join(out)
 
 
+def _num_cast(col: str):
+    """A caster per column, built once, so a 24k-row table is not 24k branches."""
+    typ = sql_type(col)
+    if typ == "INTEGER":
+        return lambda v: int(float(v)) if v not in ("", None) else None
+    if typ == "REAL":
+        return lambda v: float(v) if v not in ("", None) else None
+    return lambda v: v if v not in ("", None) else None
+
+
 def build_db(store: Store, rebuild=False) -> dict:
     path = store.root / "sysobs.sqlite"
     if rebuild and path.exists():
@@ -1328,7 +1363,9 @@ def build_db(store: Store, rebuild=False) -> dict:
             continue
         cols = ",".join(t.columns)
         marks = ",".join("?" * len(t.columns))
-        payload = [tuple(r.get(c, "") or None for c in t.columns) for r in rows]
+        casts = [(_num_cast(c)) for c in t.columns]
+        payload = [tuple(cast(r.get(c, "")) for c, cast in zip(t.columns, casts))
+                   for r in rows]
         try:
             con.executemany(f"INSERT OR REPLACE INTO {name} ({cols}) VALUES ({marks})", payload)
             loaded[name] = len(payload)
