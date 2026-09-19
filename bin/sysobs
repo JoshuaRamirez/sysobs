@@ -2405,6 +2405,8 @@ def cmd_events(args) -> int:
             return 2
         secs = int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
         cutoff = _iso_ms(time.time() - secs)
+    parent_of = {(r["pid"], r["started_at"]): r["parent_command_id"]
+                 for r in rows if r["event"] == "start" and r["parent_command_id"]}
     out = []
     for r in rows:
         if cutoff and r["ts"] < cutoff:
@@ -2412,7 +2414,8 @@ def cmd_events(args) -> int:
         if args.event and r["event"] != args.event:
             continue
         cmd = cmds.get(r["command_id"], {}).get("basename", "")
-        parent = cmds.get(r["parent_command_id"], {}).get("basename", "")
+        pcid = r["parent_command_id"] or parent_of.get((r["pid"], r["started_at"]), "")
+        parent = cmds.get(pcid, {}).get("basename", "")
         argv = argvs.get(r["argv_id"], "")
         if args.match and args.match.lower() not in f"{cmd} {parent} {argv}".lower():
             continue
