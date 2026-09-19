@@ -10,6 +10,8 @@ by id from the per-snapshot fact rows.
 
     sysobs snapshot [--files none|own|all] [--rdns] [--geo online] [--json]
     sysobs watch --interval 60 [--count N]      repeated snapshots
+    sysobs procwatch [--interval 0.1]           record every start/exit, live
+    sysobs events [--since 1h] [--match java]   what started and stopped
     sysobs list [--json]                        snapshots on record
     sysobs show <snapshot|latest> [--json]      one snapshot, resolved
     sysobs top <snapshot|latest> [--by cpu|rss|net|files|sockets]
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -36,6 +39,7 @@ import platform
 import re
 import socket as pysocket
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -217,6 +221,18 @@ _t("socket", "fact",
     "remote_port_id": ("port", "port_id")},
    "one open socket: who, which port, which addresses, how much moved")
 
+# Not per snapshot: a snapshot every 5 minutes cannot see a process that lives
+# for three seconds, so procwatch records starts and exits as they happen and
+# the snapshot job folds them in here. event_id is stable across re-ingestion
+# because it hashes (event, pid, start time) — pid alone is reused.
+_t("process_event", "fact",
+   ["event_id", "ts", "event", "pid", "ppid", "uid", "command_id", "argv",
+    "parent_command_id", "parent_argv", "started_at", "lifetime_ms", "source"],
+   ["event_id"],
+   {"command_id": ("command", "command_id"),
+    "parent_command_id": ("command", "command_id")},
+   "a process start or exit, seen between snapshots by procwatch")
+
 # Fact tables whose rows must correspond to a process row in the SAME snapshot.
 # Expressed separately because a composite FK cannot be written as a single column.
 FACT_PARENT = {
@@ -342,6 +358,86 @@ class LibProc:
             return ""
         n = self.lib.proc_pidpath(pid, self._buf, 4096)
         return self._buf.value.decode("utf-8", "replace") if n > 0 else ""
+
+    # ---- procwatch: cheap enough to run ten times a second (~1 ms per pass)
+    PROC_PIDT_SHORTBSDINFO = 13
+    CTL_KERN, KERN_PROC, KERN_PROC_PID, KERN_PROCARGS2 = 1, 14, 1, 49
+    KINFO_PROC_SIZE = 648
+
+    def list_pids(self) -> list[int]:
+        if not self.ok:
+            return []
+        n = self.lib.proc_listallpids(None, 0)
+        buf = (ctypes.c_int * (n + 512))()
+        n = self.lib.proc_listallpids(buf, ctypes.sizeof(buf))
+        return [buf[i] for i in range(max(n, 0))]
+
+    def short_info(self, pid: int) -> dict | None:
+        """ppid/uid/comm. Unlike PROC_PIDTBSDINFO this is allowed for root's
+        processes too, so a daemon's children are not invisible."""
+        si = _ShortBSDInfo()
+        n = self.lib.proc_pidinfo(pid, self.PROC_PIDT_SHORTBSDINFO, ctypes.c_uint64(0),
+                                  ctypes.byref(si), ctypes.sizeof(si))
+        if n != ctypes.sizeof(si):
+            return None
+        return {"ppid": si.pbsi_ppid, "uid": si.pbsi_uid,
+                "comm": si.pbsi_comm.decode("utf-8", "replace")}
+
+    def _sysctl(self, mib: list[int], size: int) -> bytes | None:
+        arr = (ctypes.c_int * len(mib))(*mib)
+        buf = ctypes.create_string_buffer(size)
+        sz = ctypes.c_size_t(size)
+        if self.lib.sysctl(arr, len(mib), buf, ctypes.byref(sz), None, 0) != 0 or not sz.value:
+            return None
+        return buf.raw[:sz.value]
+
+    def start_time(self, pid: int) -> tuple[int, int] | None:
+        """(sec, usec). kinfo_proc begins with p_starttime, and kern.proc.pid
+        answers for every process, which proc_pidinfo does not."""
+        raw = self._sysctl([self.CTL_KERN, self.KERN_PROC, self.KERN_PROC_PID, pid],
+                           self.KINFO_PROC_SIZE)
+        if not raw or len(raw) < 12:
+            return None
+        sec, usec = struct.unpack_from("qi", raw, 0)
+        return (sec, usec) if sec else None
+
+    def argv(self, pid: int) -> list[str] | None:
+        """Denied for other users' processes; the caller falls back to comm."""
+        raw = self._sysctl([self.CTL_KERN, self.KERN_PROCARGS2, pid], 1 << 20)
+        return parse_procargs(raw) if raw else None
+
+
+class _ShortBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbsi_pid", ctypes.c_uint32), ("pbsi_ppid", ctypes.c_uint32),
+        ("pbsi_pgid", ctypes.c_uint32), ("pbsi_status", ctypes.c_uint32),
+        ("pbsi_comm", ctypes.c_char * 16), ("pbsi_flags", ctypes.c_uint32),
+        ("pbsi_uid", ctypes.c_uint32), ("pbsi_gid", ctypes.c_uint32),
+        ("pbsi_ruid", ctypes.c_uint32), ("pbsi_rgid", ctypes.c_uint32),
+        ("pbsi_svuid", ctypes.c_uint32), ("pbsi_svgid", ctypes.c_uint32),
+        ("pbsi_rfu", ctypes.c_uint32),
+    ]
+
+
+def parse_procargs(raw: bytes) -> list[str] | None:
+    """KERN_PROCARGS2: int argc, exec path, NUL padding, then argc strings
+    (environment follows and is deliberately not read)."""
+    if len(raw) < 4:
+        return None
+    argc = struct.unpack_from("i", raw, 0)[0]
+    pos = raw.find(b"\0", 4)                  # end of exec path
+    if pos < 0:
+        return None
+    while pos < len(raw) and raw[pos] == 0:   # padding
+        pos += 1
+    out = []
+    while len(out) < argc and pos < len(raw):
+        end = raw.find(b"\0", pos)
+        if end < 0:
+            end = len(raw)
+        out.append(raw[pos:end].decode("utf-8", "replace"))
+        pos = end + 1
+    return out
 
 
 # ============================================================ the store
@@ -1466,6 +1562,13 @@ def build_db(store: Store, rebuild=False) -> dict:
         rows = store.read(name)
         if t.kind == "fact" and known and "snapshot_id" in t.columns:
             rows = [r for r in rows if r.get("snapshot_id") not in known]
+        elif t.kind == "fact" and not rebuild and "snapshot_id" not in t.columns:
+            # not snapshot-scoped (process_event): resume on its own primary key
+            try:
+                have = {r[0] for r in con.execute(f"SELECT {t.pk[0]} FROM {name}")}
+            except sqlite3.Error:
+                have = set()
+            rows = [r for r in rows if r.get(t.pk[0]) not in have]
         if not rows:
             continue
         cols = ",".join(t.columns)
@@ -1662,6 +1765,11 @@ def cmd_top(store: Store, ref: str, by: str, limit: int, as_json: bool) -> int:
     return 0
 
 
+def _locked(fn):
+    with StoreLock():
+        return fn()
+
+
 def cmd_prune(store: Store, days: int, go: bool, as_json: bool) -> int:
     cutoff = time.time() - days * 86400
     keep, drop = [], []
@@ -1683,6 +1791,12 @@ def cmd_prune(store: Store, days: int, go: bool, as_json: bool) -> int:
             store.replace(name, rows)
         # dimensions are deliberately kept: they are the shared vocabulary the
         # surviving snapshots still reference. Only ones nothing points at go.
+        cut_iso = _iso_ms(cutoff)
+        events = store.read("process_event")
+        kept_events = [r for r in events if r.get("ts", "") >= cut_iso]
+        if len(kept_events) != len(events):
+            store.replace("process_event", kept_events)
+        plan["events_dropped"] = len(events) - len(kept_events)
         removed = _gc_dimensions(store)
         plan["applied"] = True
         plan["dimensions_removed"] = removed
@@ -1719,11 +1833,243 @@ def _gc_dimensions(store: Store) -> dict[str, int]:
     return removed
 
 
+# ============================================================ procwatch
+# A snapshot every five minutes is blind to a process that lives for three
+# seconds — which is exactly the kind you want to identify after the fact
+# ("what just opened a Java icon?"). procwatch polls the pid list ten times a
+# second and records each start and exit.
+#
+# It does NOT write the store: the dimension tables are rewritten whole on
+# every flush, so a second writer would silently drop the other's rows.
+# procwatch appends to a spool; the snapshot job (one writer, under a lock)
+# folds the spool in. A missing spool therefore degrades to "events arrive
+# late", never to "the store is corrupt".
+
+SPOOL = ROOT / "spool"
+OFFSETS = ROOT / "spool" / "offsets.json"
+LOCK = ROOT / ".store.lock"
+
+
+class StoreLock:
+    """Whole-store write lock. Held across capture AND flush, because a
+    dimension read at the start is rewritten at the end."""
+
+    def __init__(self, timeout: float = 120):
+        self.timeout, self.fh = timeout, None
+
+    def __enter__(self):
+        LOCK.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = LOCK.open("a+")
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.time() > deadline:
+                    raise TimeoutError(f"store lock held by another sysobs for {self.timeout}s")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+        return False
+
+
+def _iso_ms(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+class ProcWatch:
+    """The poll loop, as a class so the selftest can drive it a tick at a time.
+
+    Identity is (pid, start_sec, start_usec): pids are reused, start times are
+    not. A process seen only inside one tick window is missed — that is stated
+    in `source`, not hidden."""
+
+    def __init__(self, lp: LibProc = None, interval: float = 0.1):
+        self.lp = lp or LibProc()
+        self.interval = interval
+        self.live: dict[int, dict] = {}
+        self.source = f"procwatch-{int(interval * 1000)}ms"
+
+    def _describe(self, pid: int) -> dict | None:
+        info = self.lp.short_info(pid)
+        if info is None:
+            return None
+        st = self.lp.start_time(pid)
+        if st is None:
+            return None
+        argv = self.lp.argv(pid)
+        exe = self.lp.exe_path(pid)
+        # argv is collapsed onto one line: a shell -c body carries newlines and
+        # runs of spaces, and a one-line-per-event log that wraps is unreadable.
+        text = " ".join(" ".join(argv).split()) if argv else info["comm"]
+        return {"pid": pid, "ppid": info["ppid"], "uid": info["uid"],
+                "comm": info["comm"], "exe": exe or (argv[0] if argv else ""),
+                "argv": text[:4096], "start": st[0] + st[1] / 1e6}
+
+    def baseline(self) -> int:
+        """Processes already running are recorded as live without a start event
+        — their start was not observed, so claiming one would be a lie."""
+        self.live = {}
+        for pid in self.lp.list_pids():
+            d = self._describe(pid)
+            if d:
+                self.live[pid] = d
+        return len(self.live)
+
+    def tick(self) -> list[dict]:
+        now = time.time()
+        events: list[dict] = []
+        pids = set(self.lp.list_pids())
+        for pid in pids - self.live.keys():
+            d = self._describe(pid)
+            if not d:                      # gone again already, within the tick
+                continue
+            self.live[pid] = d
+            parent = self.live.get(d["ppid"], {})
+            events.append({
+                "ts": _iso_ms(now), "event": "start", "pid": pid, "ppid": d["ppid"],
+                "uid": d["uid"], "exe": d["exe"], "argv": d["argv"],
+                "parent_exe": parent.get("exe", ""), "parent_argv": parent.get("argv", ""),
+                "started_at": _iso_ms(d["start"]), "lifetime_ms": "",
+                "source": self.source,
+            })
+        for pid in self.live.keys() - pids:
+            d = self.live.pop(pid)
+            events.append({
+                "ts": _iso_ms(now), "event": "exit", "pid": pid, "ppid": d["ppid"],
+                "uid": d["uid"], "exe": d["exe"], "argv": d["argv"],
+                "parent_exe": "", "parent_argv": "",
+                "started_at": _iso_ms(d["start"]),
+                "lifetime_ms": int(max(now - d["start"], 0) * 1000),
+                "source": self.source,
+            })
+        return events
+
+
+def spool_path(when: float = None) -> Path:
+    day = datetime.fromtimestamp(when or time.time(), timezone.utc).strftime("%Y%m%d")
+    return SPOOL / f"procwatch-{day}.ndjson"
+
+
+def spool_write(events: list[dict]) -> None:
+    if not events:
+        return
+    SPOOL.mkdir(parents=True, exist_ok=True)
+    path = spool_path()
+    with path.open("a", encoding="utf-8") as fh:
+        for e in events:
+            fh.write(json.dumps(e, separators=(",", ":")) + "\n")
+
+
+def event_id(e: dict) -> str:
+    return _hid("e", e["event"], str(e["pid"]), e.get("started_at", ""))
+
+
+def ingest_spool(store: Store, refs: Refs = None, keep_days: int = 3) -> dict:
+    """Fold spooled events into process_event. Resumes at a byte offset per
+    file and only ever reads whole lines, so a half-written line at the tail is
+    picked up next time rather than parsed as truncated."""
+    if not SPOOL.exists():
+        return {"files": 0, "events": 0, "spool": str(SPOOL)}
+    refs = refs or Refs(store, now_iso())
+    try:
+        offsets = json.loads(OFFSETS.read_text()) if OFFSETS.exists() else {}
+    except json.JSONDecodeError:
+        offsets = {}
+    seen = {r["event_id"] for r in store.read("process_event")}
+    total, files = 0, 0
+    for path in sorted(SPOOL.glob("procwatch-*.ndjson")):
+        start = int(offsets.get(path.name, 0))
+        size = path.stat().st_size
+        if start > size:                      # truncated/rotated under us
+            start = 0
+        if start == size:
+            continue
+        files += 1
+        with path.open("r", encoding="utf-8") as fh:
+            fh.seek(start)
+            consumed = start
+            for line in fh:
+                if not line.endswith("\n"):   # partial tail, leave it for later
+                    break
+                consumed += len(line.encode("utf-8"))
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                eid = event_id(e)
+                if eid in seen:
+                    continue
+                seen.add(eid)
+                store.fact("process_event", {
+                    "event_id": eid, "ts": e.get("ts", ""), "event": e.get("event", ""),
+                    "pid": e.get("pid", ""), "ppid": e.get("ppid", ""),
+                    "uid": e.get("uid", ""),
+                    "command_id": refs.command(e.get("exe", "")),
+                    "argv": e.get("argv", ""),
+                    "parent_command_id": refs.command(e.get("parent_exe", "")),
+                    "parent_argv": e.get("parent_argv", ""),
+                    "started_at": e.get("started_at", ""),
+                    "lifetime_ms": e.get("lifetime_ms", ""),
+                    "source": e.get("source", ""),
+                })
+                total += 1
+        offsets[path.name] = consumed
+    return {"files": files, "events": total, "offsets": offsets,
+            "spool": str(SPOOL), "keep_days": keep_days}
+
+
+def ingest_commit(result: dict) -> None:
+    """Offsets advance only after the rows they describe are on disk."""
+    if not result.get("offsets"):
+        return
+    OFFSETS.parent.mkdir(parents=True, exist_ok=True)
+    OFFSETS.write_text(json.dumps(result["offsets"], indent=2))
+    cutoff = time.time() - result.get("keep_days", 3) * 86400
+    for path in SPOOL.glob("procwatch-*.ndjson"):
+        done = result["offsets"].get(path.name, 0) >= path.stat().st_size
+        if done and path.stat().st_mtime < cutoff:
+            path.unlink()
+
+
+def cmd_procwatch(args) -> int:
+    watch = ProcWatch(interval=args.interval)
+    n = watch.baseline()
+    if not args.quiet:
+        print(f"procwatch: {n} processes already live, polling every "
+              f"{args.interval}s -> {spool_path()}", flush=True)
+    buffer: list[dict] = []
+    last_flush = time.time()
+    deadline = time.time() + args.seconds if args.seconds else None
+    while True:
+        time.sleep(args.interval)
+        try:
+            buffer += watch.tick()
+        except Exception as e:                # noqa: BLE001 — never die silently
+            print(f"procwatch: tick failed: {e}", file=sys.stderr, flush=True)
+        now = time.time()
+        if buffer and (len(buffer) >= 200 or now - last_flush >= args.flush):
+            spool_write(buffer)
+            if args.echo:
+                for e in buffer:
+                    print(f"{e['ts']} {e['event']:<5} {e['pid']:>7} {e['argv'][:120]}",
+                          flush=True)
+            buffer, last_flush = [], now
+        if deadline and now >= deadline:
+            spool_write(buffer)
+            return 0
+
+
 # ============================================================ selftest
 def selftest() -> int:
     """Behaviour fixtures for the parts that parse someone else's output format —
     the places this tool breaks quietly when macOS changes its mind."""
     import tempfile
+    global TABLES, SPOOL, OFFSETS, LOCK
     fails: list[str] = []
 
     def check(label, got, want):
@@ -1774,7 +2120,6 @@ def selftest() -> int:
 
     # round trip: write a tiny store, break one reference, confirm verify sees it
     with tempfile.TemporaryDirectory() as tmp:
-        global TABLES
         st = Store(Path(tmp))
         saved_tables = TABLES
         TABLES = st.tables
@@ -1847,9 +2192,83 @@ def selftest() -> int:
         finally:
             TABLES = saved_tables
 
+    # ---- procwatch: argv parsing, then the loop against a real short process
+    raw = struct.pack("i", 2) + b"/bin/sleep\x00\x00\x00" + b"sleep\x000.05\x00" + b"PATH=/x\x00"
+    check("procargs argc respected", parse_procargs(raw), ["sleep", "0.05"])
+    check("procargs short buffer", parse_procargs(b"\x02"), None)
+
+    lp = LibProc()
+    check("list_pids sees this process", os.getpid() in lp.list_pids(), True)
+    check("short_info reads launchd (root-owned)", (lp.short_info(1) or {}).get("comm"),
+          "launchd")
+    check("start_time reads launchd", isinstance(lp.start_time(1), tuple), True)
+    check("start_time on a dead pid", lp.start_time(999999), None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = (SPOOL, OFFSETS, LOCK, TABLES)
+        st = Store(Path(tmp))
+        SPOOL, OFFSETS, LOCK = Path(tmp) / "spool", Path(tmp) / "spool" / "offsets.json", \
+            Path(tmp) / ".store.lock"
+        TABLES = st.tables
+        try:
+            w = ProcWatch(interval=0.05)
+            w.baseline()
+            proc = subprocess.Popen(["/bin/sleep", "0.35"])
+            started, exited, deadline, reaped = [], [], time.time() + 6, False
+            while time.time() < deadline and not exited:
+                time.sleep(0.05)
+                for e in w.tick():
+                    if e["pid"] != proc.pid:
+                        continue
+                    (started if e["event"] == "start" else exited).append(e)
+                # A finished child stays in the table as a zombie until its
+                # parent reaps it, so "exit" means left the process table.
+                if not reaped and proc.poll() is not None:
+                    proc.wait()
+                    reaped = True
+            check("procwatch sees a 0.35s process start", bool(started), True)
+            check("procwatch sees it exit", bool(exited), True)
+            if started:
+                check("start event names the executable",
+                      started[0]["exe"].endswith("/sleep"), True)
+                check("start event names the parent that spawned it",
+                      (started[0]["ppid"], bool(started[0]["parent_exe"])),
+                      (os.getpid(), True))
+            if exited:
+                check("exit event carries a lifetime",
+                      300 <= int(exited[0]["lifetime_ms"]) <= 2000, True)
+                check("start and exit share one identity",
+                      started[0]["started_at"] == exited[0]["started_at"], True)
+
+            spool_write(started + exited)
+            ing = ingest_spool(st, Refs(st, now_iso()))
+            st.flush()
+            ingest_commit(ing)
+            check("ingest wrote both events", ing["events"], 2)
+            check("events are on record", len(Store(Path(tmp)).read("process_event")), 2)
+
+            again = ingest_spool(Store(Path(tmp)), Refs(st, now_iso()))
+            check("re-ingest is a no-op (offset held)", again["events"], 0)
+
+            # the offset is the only thing standing between "resume" and
+            # "duplicate every event on every snapshot"
+            OFFSETS.unlink()
+            dup = ingest_spool(Store(Path(tmp)), Refs(st, now_iso()))
+            check("replay without an offset still dedupes on event_id",
+                  dup["events"], 0)
+
+            ev = Store(Path(tmp)).read("process_event")[0]
+            check("event references a command dimension",
+                  ev["command_id"] in {r["command_id"] for r in Store(Path(tmp)).read("command")},
+                  True)
+            check("store with events verifies", verify(Store(Path(tmp)))["ok"], True)
+            check("sqlite accepts events", build_db(Store(Path(tmp)))["ok"], True)
+        finally:
+            SPOOL, OFFSETS, LOCK, TABLES = saved
+
     for line in fails:
         print(f"FAIL {line}")
-    total = 44
+    total = 61
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
@@ -1858,12 +2277,19 @@ def selftest() -> int:
 # ============================================================ cli
 def cmd_snapshot(args) -> int:
     store = Store()
-    cap = Capture(store, files_mode=args.files, rdns=args.rdns, geo=args.geo,
-                  note=args.note or "")
-    sid = cap.run()
-    written = store.flush()
+    with StoreLock():
+        cap = Capture(store, files_mode=args.files, rdns=args.rdns, geo=args.geo,
+                      note=args.note or "")
+        sid = cap.run()
+        # The snapshot job is the store's single writer, so it is also where
+        # procwatch's spool is folded in — after capture, so refs already knows
+        # the mounts each executable path lands on.
+        ingested = ingest_spool(store, cap.refs) if not getattr(args, "no_ingest", False) else {}
+        written = store.flush()
+        if ingested:
+            ingest_commit(ingested)
     result = {"snapshot_id": sid, "root": str(store.root), "written": written,
-              "collectors": cap.runs}
+              "collectors": cap.runs, "events_ingested": ingested.get("events", 0)}
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -1887,6 +2313,67 @@ def cmd_watch(args) -> int:
             break
         time.sleep(args.interval)
     return 0
+
+
+def cmd_events(args) -> int:
+    """What started and stopped between snapshots — the question a snapshot
+    cannot answer."""
+    store = Store()
+    ingested = {}
+    if not args.no_ingest:
+        with StoreLock():
+            ingested = ingest_spool(store)
+            store.flush()
+            ingest_commit(ingested)
+        store = Store()
+    rows = store.read("process_event")
+    cmds = {r["command_id"]: r for r in store.read("command")}
+    cutoff = ""
+    if args.since:
+        m = re.fullmatch(r"(\d+)([smhd])", args.since)
+        if not m:
+            print("--since wants 30m, 2h, 1d", file=sys.stderr)
+            return 2
+        secs = int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+        cutoff = _iso_ms(time.time() - secs)
+    out = []
+    for r in rows:
+        if cutoff and r["ts"] < cutoff:
+            continue
+        if args.event and r["event"] != args.event:
+            continue
+        cmd = cmds.get(r["command_id"], {}).get("basename", "")
+        parent = cmds.get(r["parent_command_id"], {}).get("basename", "")
+        text = f"{cmd} {parent} {r['argv']} {r['parent_argv']}"
+        if args.match and args.match.lower() not in text.lower():
+            continue
+        out.append({**r, "command": cmd or r["argv"][:24], "parent": parent})
+    out.sort(key=lambda r: r["ts"])
+    if args.limit:
+        out = out[-args.limit:]
+    if args.json:
+        print(json.dumps({"events": out, "ingested": ingested.get("events", 0)}, indent=2))
+        return 0
+    if not out:
+        watching = "" if _procwatch_running() else \
+            "  (procwatch is not running — nothing is recording starts/exits)"
+        print(f"no process events on record for that window{watching}")
+        return 0
+    print(f"{'WHEN':<24} {'EVENT':<5} {'PID':>7} {'PPID':>7} {'LIVED':>9}  "
+          f"{'COMMAND':<18} PARENT / ARGV")
+    for r in out:
+        lived = f"{int(r['lifetime_ms'])/1000:.1f}s" if r["lifetime_ms"] else ""
+        who = f"{r['parent'] or r['parent_argv'][:18] or '?'}"
+        print(f"{r['ts']:<24} {r['event']:<5} {r['pid']:>7} {r['ppid']:>7} {lived:>9}  "
+              f"{r['command'][:18]:<18} {who} | {r['argv'][:90]}")
+    if ingested.get("events"):
+        print(f"\n({ingested['events']} new event(s) folded in from the spool)")
+    return 0
+
+
+def _procwatch_running() -> bool:
+    rc, out = _run(["pgrep", "-f", "sysobs procwatch"])
+    return rc == 0 and bool(out.strip())
 
 
 def cmd_verify(args) -> int:
@@ -2012,6 +2499,8 @@ def main(argv=None) -> int:
     sp.add_argument("--geo", choices=("off", "online"), default="off",
                     help="online sends PUBLIC addresses to ip-api.com; off by default")
     sp.add_argument("--note", default="", help="free text stored with the snapshot")
+    sp.add_argument("--no-ingest", action="store_true",
+                    help="do not fold procwatch's spool into the store")
     sp.set_defaults(fn=cmd_snapshot)
 
     sp = common(sub.add_parser("watch", help="repeat snapshots on an interval"))
@@ -2022,6 +2511,24 @@ def main(argv=None) -> int:
     sp.add_argument("--geo", choices=("off", "online"), default="off")
     sp.add_argument("--note", default="")
     sp.set_defaults(fn=cmd_watch)
+
+    sp = sub.add_parser("procwatch", help="record every process start/exit (long-running)")
+    sp.add_argument("--interval", type=float, default=0.1,
+                    help="poll period in seconds (default 0.1; shorter catches more)")
+    sp.add_argument("--flush", type=float, default=2.0, help="spool write period")
+    sp.add_argument("--seconds", type=float, default=0, help="0 = until killed")
+    sp.add_argument("--echo", action="store_true", help="also print events as they happen")
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(fn=cmd_procwatch)
+
+    sp = common(sub.add_parser("events", help="process starts/exits between snapshots"))
+    sp.add_argument("--since", default="1h", help="30m, 2h, 1d (default 1h)")
+    sp.add_argument("--match", default="", help="substring of command, argv or parent")
+    sp.add_argument("--event", choices=("start", "exit"), default="")
+    sp.add_argument("-n", "--limit", type=int, default=60)
+    sp.add_argument("--no-ingest", action="store_true",
+                    help="read what is already stored; do not fold in the spool")
+    sp.set_defaults(fn=cmd_events)
 
     sp = common(sub.add_parser("list", help="snapshots on record"))
     sp.set_defaults(fn=lambda a: cmd_list(Store(), a.json))
@@ -2057,7 +2564,7 @@ def main(argv=None) -> int:
     sp = common(sub.add_parser("prune", help="drop old snapshots"))
     sp.add_argument("--days", type=int, required=True)
     sp.add_argument("--go", action="store_true", help="apply (default is a dry run)")
-    sp.set_defaults(fn=lambda a: cmd_prune(Store(), a.days, a.go, a.json))
+    sp.set_defaults(fn=lambda a: _locked(lambda: cmd_prune(Store(), a.days, a.go, a.json)))
 
     sp = sub.add_parser("selftest", help="behaviour fixtures")
     sp.set_defaults(fn=lambda a: selftest())

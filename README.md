@@ -66,6 +66,7 @@ table:
 | `process_net_sample` | bytes in and out per pid (`nettop`) |
 | `process_file` | pid → fd → file location |
 | `socket` | pid → fd → protocol, both addresses, both ports, state, bytes |
+| `process_event` | a start or exit seen *between* snapshots, with its parent |
 | `volume_sample` | disk usage per volume |
 | `disk_io_sample` | throughput per device |
 | `interface_sample` | packets and bytes per interface |
@@ -126,6 +127,49 @@ start and exit between collectors) is dropped, and the drop is *counted in
 `sysobs prune --days N --go` drops old snapshots and then garbage-collects
 dimension rows nothing points at any more, in dependency order, so the store
 never passes through a state where a reference dangles.
+
+## Between snapshots: process starts and exits
+
+A snapshot every five minutes cannot see a process that lived for three
+seconds — so it cannot answer *"what just opened a Java icon, and who
+launched it?"*. `procwatch` closes that gap: it polls the pid list ten times a
+second and records each **start** and **exit** with pid, ppid, uid,
+executable, argv, **the parent's argv**, and how long the process lived.
+
+```sh
+sysobs procwatch                       # foreground, ~0.3% of one core
+sysobs events --since 1h               # what started and stopped
+sysobs events --match java             # ...matching a command, argv or parent
+sysobs events --event exit -n 20
+```
+
+Install it as an always-on agent:
+
+```sh
+sed "s|__HOME__|$HOME|g" contrib/local.sysobs-procwatch.plist \
+  > ~/Library/LaunchAgents/local.sysobs-procwatch.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.sysobs-procwatch.plist
+```
+
+Two properties worth knowing:
+
+- **It is not the store's writer.** Dimension tables are rewritten whole on
+  every flush, so a second writer would silently drop the first one's rows.
+  `procwatch` appends to `spool/procwatch-<day>.ndjson`; the snapshot job folds
+  the spool into `process_event` under a lock, resuming from a byte offset and
+  deduping on `event_id`. A stopped procwatch degrades to *events arrive late*,
+  never to *the store is corrupt*. `sysobs events` also ingests, so it never
+  makes you wait for the next snapshot.
+- **Identity is (pid, start time)**, because pids are reused and start times
+  are not. "exit" means *left the process table*, so a zombie's lifetime
+  includes the wait for its parent to reap it.
+
+Blind spot, stated rather than hidden: a process shorter than the poll
+interval may be missed, and each event records the interval that saw it in
+`source` (`procwatch-100ms`). A real `java -version` lives ~20 ms and is a coin
+flip; anything that draws a window lives far longer and is always caught.
+Exact capture of every exec would need `/usr/bin/eslogger`, which requires a
+root LaunchDaemon and a Full Disk Access grant.
 
 ## What it cannot see, and says so
 
