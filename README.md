@@ -51,6 +51,7 @@ table:
 | `interface` | a network interface |
 | `file` | a file path, split into directory / basename / extension, bound to its `volume` |
 | `command` | an executable image, normalized onto its `file` |
+| `argv` | a full command line, stored once however many processes ran it |
 | `ip_address` | an address, with offline scope, optional rDNS and optional geo |
 | `port` | a protocol/port pair, named from `/etc/services` |
 
@@ -151,7 +152,7 @@ sed "s|__HOME__|$HOME|g" contrib/local.sysobs-procwatch.plist \
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.sysobs-procwatch.plist
 ```
 
-Two properties worth knowing:
+Three properties worth knowing:
 
 - **It is not the store's writer.** Dimension tables are rewritten whole on
   every flush, so a second writer would silently drop the first one's rows.
@@ -163,6 +164,13 @@ Two properties worth knowing:
 - **Identity is (pid, start time)**, because pids are reused and start times
   are not. "exit" means *left the process table*, so a zombie's lifetime
   includes the wait for its parent to reap it.
+- **It is bounded on disk.** Events arrive at 200–800 a minute, so raw they
+  would cost ~300 MB a day. Command lines repeat hard — 11k events carried
+  1.8k distinct ones — so `argv` is a dimension and the fact row is a
+  reference, which is the same rule the rest of the schema follows. Spool
+  files are hourly and deleted once fully ingested and a few hours old;
+  `sysobs prune --days 14 --event-days 3` keeps events on their own, much
+  shorter clock than snapshots.
 
 Blind spot, stated rather than hidden: a process shorter than the poll
 interval may be missed, and each event records the interval that saw it in

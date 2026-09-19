@@ -109,6 +109,11 @@ _t("file", "dim",
    ["file_id"], {"volume_id": ("volume", "volume_id")},
    "THE normalized file location: every path in the log points here, once")
 
+_t("argv", "dim",
+   ["argv_id", "text", "length", "first_seen", "last_seen"],
+   ["argv_id"], {},
+   "a full command line, stored once however many processes were run with it")
+
 _t("command", "dim",
    ["command_id", "exe_path", "basename", "file_id", "first_seen", "last_seen"],
    ["command_id"], {"file_id": ("file", "file_id")},
@@ -226,10 +231,11 @@ _t("socket", "fact",
 # the snapshot job folds them in here. event_id is stable across re-ingestion
 # because it hashes (event, pid, start time) — pid alone is reused.
 _t("process_event", "fact",
-   ["event_id", "ts", "event", "pid", "ppid", "uid", "command_id", "argv",
-    "parent_command_id", "parent_argv", "started_at", "lifetime_ms", "source"],
+   ["event_id", "ts", "event", "pid", "ppid", "uid", "command_id", "argv_id",
+    "parent_command_id", "started_at", "lifetime_ms", "source"],
    ["event_id"],
    {"command_id": ("command", "command_id"),
+    "argv_id": ("argv", "argv_id"),
     "parent_command_id": ("command", "command_id")},
    "a process start or exit, seen between snapshots by procwatch")
 
@@ -585,6 +591,7 @@ class Refs:
         self._file_cache: dict[str, str] = {}
         self._addr_cache: dict[str, str] = {}
         self._port_cache: dict[tuple[str, int], str] = {}
+        self._argv_cache: dict[str, str] = {}
 
     def register_mount(self, volume_id: str, mount_point: str) -> None:
         self.mounts.append((mount_point, volume_id))
@@ -611,6 +618,20 @@ class Refs:
         }, self.seen)
         self._file_cache[path] = fid
         return fid
+
+    def argv(self, text: str) -> str:
+        """Command lines repeat hard: a login shell or a polling loop runs the
+        same 200 characters thousands of times a day. Stored once."""
+        if not text:
+            return ""
+        cached = self._argv_cache.get(text)
+        if cached:
+            return cached
+        aid = _hid("g", text)
+        self.s.dim("argv", {"argv_id": aid, "text": text, "length": len(text)},
+                   self.seen)
+        self._argv_cache[text] = aid
+        return aid
 
     def command(self, exe_path: str) -> str:
         if not exe_path:
@@ -1383,6 +1404,28 @@ def verify(store: Store) -> dict:
                 add("fk_dangling", name,
                     f"{col} -> {tgt_table}.{tgt_col} does not resolve", bad)
 
+    # 3b. a column that should hold a number holds one. Width-correct rows can
+    # still be shifted by one — e.g. when an appending writer and the file it
+    # appends to disagree about the schema — and every key check above passes
+    # while the data is nonsense.
+    for name, table in SCHEMA.items():
+        for col in table.columns:
+            if sql_type(col) == "TEXT":
+                continue
+            bad = []
+            for row in data[name]:
+                v = row.get(col, "")
+                if v in ("", None):
+                    continue
+                try:
+                    float(v)
+                except (TypeError, ValueError):
+                    if len(bad) < 5:
+                        bad.append({col: v, **{c: row.get(c) for c in table.pk}})
+            if bad:
+                add("type_mismatch", name,
+                    f"{col} should be numeric — rows may be shifted", bad)
+
     # 4. composite parents (a per-process fact must have its process row)
     proc_keys = {(r["snapshot_id"], r["pid"]) for r in data["process"]}
     for name, (parent, cols) in FACT_PARENT.items():
@@ -1770,8 +1813,10 @@ def _locked(fn):
         return fn()
 
 
-def cmd_prune(store: Store, days: int, go: bool, as_json: bool) -> int:
+def cmd_prune(store: Store, days: int, go: bool, as_json: bool,
+              event_days: int = None) -> int:
     cutoff = time.time() - days * 86400
+    event_days = days if event_days is None else event_days
     keep, drop = [], []
     for r in store.read("snapshot"):
         try:
@@ -1780,8 +1825,8 @@ def cmd_prune(store: Store, days: int, go: bool, as_json: bool) -> int:
         except ValueError:
             ts = time.time()
         (drop if ts < cutoff else keep).append(r["snapshot_id"])
-    plan = {"root": str(store.root), "days": days, "keep": len(keep),
-            "drop": drop, "applied": False}
+    plan = {"root": str(store.root), "days": days, "event_days": event_days,
+            "keep": len(keep), "drop": drop, "applied": False}
     if go and drop:
         dropset = set(drop)
         for name, t in SCHEMA.items():
@@ -1791,7 +1836,7 @@ def cmd_prune(store: Store, days: int, go: bool, as_json: bool) -> int:
             store.replace(name, rows)
         # dimensions are deliberately kept: they are the shared vocabulary the
         # surviving snapshots still reference. Only ones nothing points at go.
-        cut_iso = _iso_ms(cutoff)
+        cut_iso = _iso_ms(time.time() - event_days * 86400)
         events = store.read("process_event")
         kept_events = [r for r in events if r.get("ts", "") >= cut_iso]
         if len(kept_events) != len(events):
@@ -1804,6 +1849,8 @@ def cmd_prune(store: Store, days: int, go: bool, as_json: bool) -> int:
         print(json.dumps(plan, indent=2))
     else:
         print(f"{len(drop)} snapshot(s) older than {days}d, {len(keep)} kept"
+              + (f", events older than {event_days}d dropped"
+                 if plan.get("events_dropped") else "")
               + ("" if go else "  (dry run — add --go)"))
         if plan.get("dimensions_removed"):
             print("unreferenced dimension rows removed: "
@@ -1820,7 +1867,7 @@ def _gc_dimensions(store: Store) -> dict[str, int]:
         for col, target in t.fks.items():
             if target:
                 referrers.setdefault(target[0], []).append((name, col))
-    for dim in ("command", "file", "ip_address", "port", "volume", "disk_device",
+    for dim in ("argv", "command", "file", "ip_address", "port", "volume", "disk_device",
                 "interface", "host"):
         used = set()
         for tname, col in referrers.get(dim, []):
@@ -1951,8 +1998,8 @@ class ProcWatch:
 
 
 def spool_path(when: float = None) -> Path:
-    day = datetime.fromtimestamp(when or time.time(), timezone.utc).strftime("%Y%m%d")
-    return SPOOL / f"procwatch-{day}.ndjson"
+    hour = datetime.fromtimestamp(when or time.time(), timezone.utc).strftime("%Y%m%dT%H")
+    return SPOOL / f"procwatch-{hour}.ndjson"
 
 
 def spool_write(events: list[dict]) -> None:
@@ -1969,7 +2016,7 @@ def event_id(e: dict) -> str:
     return _hid("e", e["event"], str(e["pid"]), e.get("started_at", ""))
 
 
-def ingest_spool(store: Store, refs: Refs = None, keep_days: int = 3) -> dict:
+def ingest_spool(store: Store, refs: Refs = None, keep_hours: int = 6) -> dict:
     """Fold spooled events into process_event. Resumes at a byte offset per
     file and only ever reads whole lines, so a half-written line at the tail is
     picked up next time rather than parsed as truncated."""
@@ -2010,9 +2057,8 @@ def ingest_spool(store: Store, refs: Refs = None, keep_days: int = 3) -> dict:
                     "pid": e.get("pid", ""), "ppid": e.get("ppid", ""),
                     "uid": e.get("uid", ""),
                     "command_id": refs.command(e.get("exe", "")),
-                    "argv": e.get("argv", ""),
+                    "argv_id": refs.argv(e.get("argv", "")),
                     "parent_command_id": refs.command(e.get("parent_exe", "")),
-                    "parent_argv": e.get("parent_argv", ""),
                     "started_at": e.get("started_at", ""),
                     "lifetime_ms": e.get("lifetime_ms", ""),
                     "source": e.get("source", ""),
@@ -2020,7 +2066,7 @@ def ingest_spool(store: Store, refs: Refs = None, keep_days: int = 3) -> dict:
                 total += 1
         offsets[path.name] = consumed
     return {"files": files, "events": total, "offsets": offsets,
-            "spool": str(SPOOL), "keep_days": keep_days}
+            "spool": str(SPOOL), "keep_hours": keep_hours}
 
 
 def ingest_commit(result: dict) -> None:
@@ -2029,11 +2075,17 @@ def ingest_commit(result: dict) -> None:
         return
     OFFSETS.parent.mkdir(parents=True, exist_ok=True)
     OFFSETS.write_text(json.dumps(result["offsets"], indent=2))
-    cutoff = time.time() - result.get("keep_days", 3) * 86400
+    # A spooled file that is fully ingested is redundant: the store holds the
+    # same events normalized, at a fraction of the size. Keep a few hours as a
+    # replay window, then drop them — unbounded spool is how this kind of
+    # recorder quietly eats a disk.
+    cutoff = time.time() - result.get("keep_hours", 6) * 3600
     for path in SPOOL.glob("procwatch-*.ndjson"):
         done = result["offsets"].get(path.name, 0) >= path.stat().st_size
         if done and path.stat().st_mtime < cutoff:
             path.unlink()
+            result["offsets"].pop(path.name, None)
+    OFFSETS.write_text(json.dumps(result["offsets"], indent=2))
 
 
 def cmd_procwatch(args) -> int:
@@ -2245,6 +2297,11 @@ def selftest() -> int:
             st.flush()
             ingest_commit(ing)
             check("ingest wrote both events", ing["events"], 2)
+            check("argv text is normalized, not inlined",
+                  "argv" in Store(Path(tmp)).read("process_event")[0], False)
+            check("one argv row per distinct command line",
+                  len({r["text"] for r in Store(Path(tmp)).read("argv")}),
+                  len(Store(Path(tmp)).read("argv")))
             check("events are on record", len(Store(Path(tmp)).read("process_event")), 2)
 
             again = ingest_spool(Store(Path(tmp)), Refs(st, now_iso()))
@@ -2262,13 +2319,24 @@ def selftest() -> int:
                   ev["command_id"] in {r["command_id"] for r in Store(Path(tmp)).read("command")},
                   True)
             check("store with events verifies", verify(Store(Path(tmp)))["ok"], True)
+
+            # a row shifted by one column keeps every key intact and still
+            # means nothing — this is the check that catches it
+            st6 = Store(Path(tmp))
+            shifted = st6.read("process_event")
+            shifted[0]["lifetime_ms"] = shifted[0]["source"]
+            st6.replace("process_event", shifted)
+            rep = verify(Store(Path(tmp)))
+            check("shifted row detected by type", 
+                  any(f["check"] == "type_mismatch" for f in rep["findings"]), True)
+            st6.replace("process_event", Store(Path(tmp)).read("process_event")[1:])
             check("sqlite accepts events", build_db(Store(Path(tmp)))["ok"], True)
         finally:
             SPOOL, OFFSETS, LOCK, TABLES = saved
 
     for line in fails:
         print(f"FAIL {line}")
-    total = 61
+    total = 64
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
@@ -2328,6 +2396,7 @@ def cmd_events(args) -> int:
         store = Store()
     rows = store.read("process_event")
     cmds = {r["command_id"]: r for r in store.read("command")}
+    argvs = {r["argv_id"]: r["text"] for r in store.read("argv")}
     cutoff = ""
     if args.since:
         m = re.fullmatch(r"(\d+)([smhd])", args.since)
@@ -2344,10 +2413,10 @@ def cmd_events(args) -> int:
             continue
         cmd = cmds.get(r["command_id"], {}).get("basename", "")
         parent = cmds.get(r["parent_command_id"], {}).get("basename", "")
-        text = f"{cmd} {parent} {r['argv']} {r['parent_argv']}"
-        if args.match and args.match.lower() not in text.lower():
+        argv = argvs.get(r["argv_id"], "")
+        if args.match and args.match.lower() not in f"{cmd} {parent} {argv}".lower():
             continue
-        out.append({**r, "command": cmd or r["argv"][:24], "parent": parent})
+        out.append({**r, "command": cmd or argv[:24], "parent": parent, "argv": argv})
     out.sort(key=lambda r: r["ts"])
     if args.limit:
         out = out[-args.limit:]
@@ -2363,7 +2432,7 @@ def cmd_events(args) -> int:
           f"{'COMMAND':<18} PARENT / ARGV")
     for r in out:
         lived = f"{int(r['lifetime_ms'])/1000:.1f}s" if r["lifetime_ms"] else ""
-        who = f"{r['parent'] or r['parent_argv'][:18] or '?'}"
+        who = r["parent"] or "?"
         print(f"{r['ts']:<24} {r['event']:<5} {r['pid']:>7} {r['ppid']:>7} {lived:>9}  "
               f"{r['command'][:18]:<18} {who} | {r['argv'][:90]}")
     if ingested.get("events"):
@@ -2563,8 +2632,12 @@ def main(argv=None) -> int:
 
     sp = common(sub.add_parser("prune", help="drop old snapshots"))
     sp.add_argument("--days", type=int, required=True)
+    sp.add_argument("--event-days", type=int, default=None,
+                    help="separate retention for process_event, which arrives "
+                         "hundreds of times a minute (default: same as --days)")
     sp.add_argument("--go", action="store_true", help="apply (default is a dry run)")
-    sp.set_defaults(fn=lambda a: _locked(lambda: cmd_prune(Store(), a.days, a.go, a.json)))
+    sp.set_defaults(fn=lambda a: _locked(
+        lambda: cmd_prune(Store(), a.days, a.go, a.json, a.event_days)))
 
     sp = sub.add_parser("selftest", help="behaviour fixtures")
     sp.set_defaults(fn=lambda a: selftest())
