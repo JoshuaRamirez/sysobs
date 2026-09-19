@@ -744,12 +744,15 @@ class Capture:
         if ba == "":
             ba = self._signed(grab("Amperage"))
         soc = grab("StateOfCharge")
+        external = int('ExternalConnected" = Yes' in out)
         cap_mw = watts * 1000 if watts else None
         demand = sysload if sysload is not None else pin
         headroom = (cap_mw - demand) if (cap_mw is not None and demand is not None) else ""
         # capped when demand is within 10% of what the adapter can deliver, or
         # when the battery is being drained despite an external supply
-        capped = ""
+        # An empty verdict would be indistinguishable from "could not tell".
+        # On battery there is no adapter to be capped BY, so say 0, not blank.
+        capped = "" if external else 0
         if cap_mw and demand is not None:
             capped = int(demand >= cap_mw * 0.9)
         # Trust the current, not the power field: with a 140W supply and the
@@ -758,7 +761,6 @@ class Capture:
         # starved (-33mA on AC) and the recovered state, so it decides.
         if isinstance(ba, int) and ba < 0 and external:
             capped = 1
-        external = int("ExternalConnected\" = Yes" in out)
         desc = re.search(r'"Description"="([^"]+)"', out)
         self.s.fact("power_sample", {
             "snapshot_id": self.sid, "adapter_watts": watts,
@@ -778,7 +780,10 @@ class Capture:
             "headroom_mw": headroom, "power_capped": capped,
         })
         msg = ""
-        if capped == 1:
+        if not external:
+            msg = (f"on battery: {soc}% charge, drawing {(demand or 0)/1000:.1f}W"
+                   f"{f', {ba}mA' if isinstance(ba, int) else ''}")
+        elif capped == 1:
             msg = (f"POWER CAPPED: {desc.group(1) if desc else 'adapter'} supplies "
                    f"{watts}W, machine is asking for {(demand or 0)/1000:.1f}W")
         return 1, 1 if capped == 1 else 0, msg
