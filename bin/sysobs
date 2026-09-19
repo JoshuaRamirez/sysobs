@@ -737,8 +737,11 @@ class Capture:
             return int(m.group(1)) if m else None
 
         watts = grab("Watts")
-        pin = grab("SystemPowerIn")
-        sysload = grab("SystemLoad")
+        # Every one of these telemetry words is unsigned in the IORegistry, not
+        # just the battery ones: SystemLoad came back as 18446744073709540847
+        # (-10769 mW) during an adapter transition and overflowed SQLite.
+        pin = self._signed(grab("SystemPowerIn"))
+        sysload = self._signed(grab("SystemLoad"))
         bp = self._signed(grab("BatteryPower"))
         ba = self._signed(grab("InstantAmperage", sep="="))
         if ba == "":
@@ -747,14 +750,17 @@ class Capture:
         external = int('ExternalConnected" = Yes' in out)
         cap_mw = watts * 1000 if watts else None
         demand = sysload if sysload is not None else pin
-        headroom = (cap_mw - demand) if (cap_mw is not None and demand is not None) else ""
+        # a transient negative reading is real telemetry, but it must not be
+        # turned into a flattering headroom figure
+        usable = demand if isinstance(demand, int) and demand > 0 else None
+        headroom = (cap_mw - usable) if (cap_mw is not None and usable is not None) else ""
         # capped when demand is within 10% of what the adapter can deliver, or
         # when the battery is being drained despite an external supply
         # An empty verdict would be indistinguishable from "could not tell".
         # On battery there is no adapter to be capped BY, so say 0, not blank.
         capped = "" if external else 0
-        if cap_mw and demand is not None:
-            capped = int(demand >= cap_mw * 0.9)
+        if cap_mw and usable is not None:
+            capped = int(usable >= cap_mw * 0.9)
         # Trust the current, not the power field: with a 140W supply and the
         # battery charging at +6110mA, PowerTelemetryData still reported
         # BatteryPower=-522mW. InstantAmperage matched reality in both the
@@ -770,7 +776,7 @@ class Capture:
             "external_connected": external,
             "charging": int('"IsCharging" = Yes' in out),
             "system_power_in_mw": pin, "system_load_mw": sysload,
-            "adapter_efficiency_loss_mw": grab("AdapterEfficiencyLoss"),
+            "adapter_efficiency_loss_mw": self._signed(grab("AdapterEfficiencyLoss")),
             "battery_power_mw": bp, "battery_ma": ba, "soc_pct": soc,
             "daily_min_soc": grab("DailyMinSoc"), "daily_max_soc": grab("DailyMaxSoc"),
             "cycle_count": grab("CycleCount"),
@@ -1443,12 +1449,23 @@ def build_db(store: Store, rebuild=False) -> dict:
     con = sqlite3.connect(path)
     con.executescript(ddl())
     loaded, skipped = {}, {}
+    # Facts are append-only, so a rebuild of the whole store on every sync is
+    # waste that grows without bound. Load only snapshots the mirror lacks;
+    # dimensions are re-upserted because first_seen/last_seen move.
+    known: set[str] = set()
+    if not rebuild:
+        try:
+            known = {r[0] for r in con.execute("SELECT snapshot_id FROM snapshot")}
+        except sqlite3.Error:
+            known = set()
     order = [n for n, t in SCHEMA.items() if t.kind == "dim" and n not in ("file", "command")]
     order += ["volume", "file", "command", "snapshot"]
     order += [n for n, t in SCHEMA.items() if t.kind == "fact" and n != "snapshot"]
     for name in dict.fromkeys(order):
         t = SCHEMA[name]
         rows = store.read(name)
+        if t.kind == "fact" and known and "snapshot_id" in t.columns:
+            rows = [r for r in rows if r.get("snapshot_id") not in known]
         if not rows:
             continue
         cols = ",".join(t.columns)
@@ -1466,8 +1483,20 @@ def build_db(store: Store, rebuild=False) -> dict:
                   for r in con.execute("PRAGMA foreign_key_check").fetchall()]
     con.close()
     return {"db": str(path), "loaded": loaded, "rejected": skipped,
+            "snapshots_already_mirrored": len(known),
             "foreign_key_violations": violations,
             "ok": not skipped and not violations}
+
+
+def db_is_stale(store: Store) -> bool:
+    """The mirror is derived, so it can silently fall behind the store it was
+    derived from — which is exactly what happens once a scheduled job is
+    appending snapshots. Compare mtimes rather than trusting it."""
+    path = store.root / "sysobs.sqlite"
+    if not path.exists():
+        return True
+    db_mtime = path.stat().st_mtime
+    return any(f.stat().st_mtime > db_mtime for f in store.tables.glob("*.csv"))
 
 
 # ============================================================ reading commands
@@ -1731,6 +1760,8 @@ def selftest() -> int:
     tail = Capture._NETSTAT_TAIL.match(
         "LISTEN                 0            0  131072  131072       python3.12:83615  00100 ")
     check("unsigned wrap: discharging", Capture._signed(18446744073709551583), -33)
+    check("unsigned wrap: system load", Capture._signed(18446744073709540847), -10769)
+    check("unsigned wrap: fits sqlite", abs(Capture._signed(18446744073709540847)) < 2**63, True)
     check("unsigned wrap: charging", Capture._signed(6110), 6110)
     check("unsigned wrap: zero", Capture._signed(0), 0)
     check("unsigned wrap: absent", Capture._signed(None), "")
@@ -1795,12 +1826,30 @@ def selftest() -> int:
             db = build_db(Store(Path(tmp)))
             check("sqlite accepts the store", db["ok"], True)
             check("sqlite has no fk violations", db["foreign_key_violations"], [])
+
+            # a mirror that silently falls behind an appending store is the
+            # failure mode a scheduled snapshot job creates
+            st5 = Store(Path(tmp))
+            check("fresh mirror is not stale", db_is_stale(st5), False)
+            st5.fact("snapshot", {"snapshot_id": "s_2", "host_id": "",
+                                  "started_at": "y", "files_mode": "none"})
+            st5.fact("host_sample", {"snapshot_id": "s_2"})
+            st5.fact("process", {"snapshot_id": "s_2", "pid": 7, "ppid": 0,
+                                 "command_id": cid, "argv": "true"})
+            st5.flush()
+            check("append makes mirror stale", db_is_stale(Store(Path(tmp))), True)
+            inc = build_db(Store(Path(tmp)))
+            check("incremental skips mirrored snapshots",
+                  inc["snapshots_already_mirrored"], 1)
+            check("incremental loads only the new snapshot",
+                  inc["loaded"].get("process"), 1)
+            check("sync clears staleness", db_is_stale(Store(Path(tmp))), False)
         finally:
             TABLES = saved_tables
 
     for line in fails:
         print(f"FAIL {line}")
-    total = 37
+    total = 44
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
@@ -1875,13 +1924,24 @@ def cmd_db(args) -> int:
                 print(f"  REJECTED {name}: {err}")
         if report["foreign_key_violations"]:
             print(f"  {len(report['foreign_key_violations'])} foreign key violations")
+        if report.get("snapshots_already_mirrored"):
+            print(f"  ({report['snapshots_already_mirrored']} snapshots already "
+                  f"mirrored; --rebuild to reload everything)")
         if report["ok"]:
             print("\nforeign keys enforced by sqlite: clean")
     return 0 if report["ok"] else 1
 
 
 def cmd_query(args) -> int:
+    store = Store()
     path = ROOT / "sysobs.sqlite"
+    if not args.no_sync and db_is_stale(store):
+        report = build_db(store)
+        added = sum(report["loaded"].get(n, 0) for n, t in SCHEMA.items()
+                    if t.kind == "fact")
+        if added:
+            print(f"(mirror was behind the store; loaded {added} new fact rows)",
+                  file=sys.stderr)
     if not path.exists():
         print("no database yet — run: sysobs db", file=sys.stderr)
         return 1
@@ -1986,6 +2046,8 @@ def main(argv=None) -> int:
 
     sp = common(sub.add_parser("query", help="SQL against the mirror"))
     sp.add_argument("sql")
+    sp.add_argument("--no-sync", action="store_true",
+                    help="do not refresh the mirror first (faster, may be stale)")
     sp.set_defaults(fn=cmd_query)
 
     sp = common(sub.add_parser("schema", help="tables, keys and references"))
