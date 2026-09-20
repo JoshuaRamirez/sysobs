@@ -1,0 +1,53 @@
+name: Bug report
+description: Something sysobs did wrong, or read wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste raw store contents.** Command lines and socket
+        addresses often contain secrets. Redact before pasting.
+        For a security issue, use private reporting instead — see SECURITY.md.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, and what it did.
+      placeholder: |
+        $ sysobs snapshot --files own
+        ...
+    validations: {required: true}
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations: {required: true}
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Output of `sysobs selftest`
+      description: This is usually the fastest way to find a parsing regression.
+      render: shell
+    validations: {required: true}
+  - type: input
+    id: version
+    attributes:
+      label: sysobs version
+      description: "`sysobs --version`"
+    validations: {required: true}
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and hardware
+      description: "`sw_vers -productVersion`, and Apple silicon or Intel"
+    validations: {required: true}
+  - type: textarea
+    id: substrate
+    attributes:
+      label: If a collector misread something, the raw line it misread
+      description: >
+        sysobs parses ps, lsof, netstat, nettop, ioreg and vm_stat. If one of
+        them produced a format it did not expect, the exact line is the single
+        most useful thing you can provide — it becomes a test fixture. Redact
+        anything sensitive first.
+      render: shell

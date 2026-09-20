@@ -1,0 +1,27 @@
+name: Feature request
+description: Something sysobs should be able to answer and cannot
+labels: [enhancement]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: The question you could not answer
+      description: >
+        Frame it as a question about a machine rather than as a feature.
+        "Which process held the socket when the disk filled" says more about
+        what to build than "add socket history".
+    validations: {required: true}
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today instead
+    validations: {required: false}
+  - type: textarea
+    id: schema
+    attributes:
+      label: Does this need a new table or column?
+      description: >
+        The schema is a single source of truth that generates the CSV headers,
+        the SQLite DDL and the integrity checker. New data usually means a new
+        dimension or fact — a rough sketch helps.
+    validations: {required: false}
