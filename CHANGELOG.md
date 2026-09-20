@@ -22,7 +22,7 @@ The release that made it installable by someone other than its author.
   keeps every snapshot inside a rolling detail window, then one per bucket out
   to the horizon, then nothing. Flat `--days` still works unchanged. Makes a
   1-minute cadence affordable: full detail for 48h and one per 15 min for a
-  year costs ~1.3 GB instead of ~240 GB.
+  year costs ~14 GB instead of ~195 GB.
 - `install.sh` — idempotent installer. Runs `selftest` first and refuses to
   install if it fails, renders the launchd units from templates, and writes
   `svc` descriptors when `svc` is present. `--dry-run`, `--prefix`, `--store`,

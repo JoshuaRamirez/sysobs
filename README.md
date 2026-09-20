@@ -360,7 +360,8 @@ Measured on an M-series Mac, 5-minute cadence with `procwatch` running:
 |---|---|
 | one snapshot, `--files none` | **~4.0 s median, 6.4 s p95** — about **1.3% of one core** |
 | `procwatch`, continuously | **~0.9% of one core, 18 MB RSS** |
-| store growth | **~135 MB/day** of CSV |
+| store growth | **~135 MB/day** of CSV at 5-min cadence |
+| marginal cost of one snapshot | **~370 KB** of fact rows |
 | the SQLite mirror | derived, rebuildable, not part of the cost |
 
 CPU is not the constraint. **Disk is**, and it scales with cadence:
@@ -401,8 +402,13 @@ The installed prune agent runs this weekly, and the defaults are
 ```
 
 That combination — a snapshot every minute, full detail for 48 hours, then
-one every 15 minutes for a year — costs roughly 1.3 GB rather than the
-240 GB the same cadence would need unthinned.
+one every 15 minutes for a year — is about **14 GB of fact rows**, against
+roughly **195 GB** for the same cadence kept unthinned.
+
+Size it from the **marginal** cost, not the average: a snapshot adds about
+**370 KB** of fact rows. Dimensions are shared and grow sub-linearly (35 MB
+here across 517 snapshots), and `process_event` is retained on its own clock
+via `--event-days`, so it does not scale with cadence at all.
 
 ## Known asymmetry
 
