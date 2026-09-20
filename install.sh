@@ -149,6 +149,14 @@ if [ "$WANT_AGENTS" = 1 ]; then
     case "$oldlabel" in
       "$L_SNAP"|"$L_PROC"|"$L_PRUNE") continue ;;
     esac
+    # Only supersede an agent that writes the SAME store. Two collectors on
+    # two different stores are not a conflict; two on one store is, because
+    # dimension tables are rewritten whole and the loser's rows vanish.
+    oldstore="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SYSOBS_HOME' "$old" 2>/dev/null || echo "$STORE")"
+    if [ "$oldstore" != "$STORE" ]; then
+      say "leaving $oldlabel alone — it writes $oldstore, not $STORE"
+      continue
+    fi
     say "superseding previous install: $oldlabel"
     run launchctl bootout "gui/$UID/$oldlabel" 2>/dev/null || true
     run rm -f "$old"

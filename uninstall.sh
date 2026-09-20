@@ -18,6 +18,8 @@ SVCDIR="${XDG_CONFIG_HOME:-$HOME/.config}/svc/services.d"
 
 PURGE=0
 RMLOGS=0
+FORCE=0
+WANT_AGENTS=1
 ALL_LABELS=0
 DRYRUN=0
 YES=0
@@ -32,6 +34,9 @@ usage: ./uninstall.sh [options]
   --logs              also delete $LOGDIR/sysobs*.log
   --all-labels        remove every sysobs agent found, whatever its label
                       prefix — use this to clean up after an older install
+  --no-agents         leave the launchd agents alone, remove the command only
+  --force             remove matching agents even if they point at a DIFFERENT
+                      install than --prefix (normally those are left alone)
   --prefix DIR        where the executable was installed (default $PREFIX)
   --label-prefix S    launchd label prefix        (default $LABEL_PREFIX)
   --store DIR         store location              (default $STORE)
@@ -49,6 +54,8 @@ while [ $# -gt 0 ]; do
     --purge)        PURGE=1; shift ;;
     --logs)         RMLOGS=1; shift ;;
     --all-labels)   ALL_LABELS=1; shift ;;
+    --no-agents)    WANT_AGENTS=0; shift ;;
+    --force)        FORCE=1; shift ;;
     --prefix)       PREFIX="$2"; shift 2 ;;
     --label-prefix) LABEL_PREFIX="$2"; shift 2 ;;
     --store)        STORE="$2"; shift 2 ;;
@@ -65,7 +72,13 @@ run()  { if [ "$DRYRUN" = 1 ]; then printf '  would: %s\n' "$*"; else "$@"; fi; 
 
 # ---------------------------------------------------------------- agents
 
-step "Stopping and removing launchd agents"
+TARGET="$PREFIX/bin/sysobs"
+
+if [ "$WANT_AGENTS" = 0 ]; then
+  step "Leaving launchd agents alone (--no-agents)"
+fi
+
+[ "$WANT_AGENTS" = 1 ] && step "Stopping and removing launchd agents"
 
 labels=()
 if [ "$ALL_LABELS" = 1 ]; then
@@ -77,10 +90,29 @@ else
   labels=("$LABEL_PREFIX" "$LABEL_PREFIX-procwatch" "$LABEL_PREFIX-prune")
 fi
 
+# An agent only belongs to THIS install if it actually runs THIS executable.
+# Without that check, uninstalling a throwaway --prefix would boot out the
+# real agents, because the default label prefix matches them both.
+belongs_to_this_install() {
+  local plist="$1"
+  [ -e "$plist" ] || return 0            # no plist to read: nothing to contradict
+  local prog
+  prog="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null)" || return 0
+  [ "$prog" = "$TARGET" ]
+}
+
 found=0
+[ "$WANT_AGENTS" = 0 ] && labels=()
 for label in "${labels[@]:-}"; do
   [ -n "$label" ] || continue
   plist="$AGENTS/$label.plist"
+  if [ "$FORCE" = 0 ] && [ "$ALL_LABELS" = 0 ] && ! belongs_to_this_install "$plist"; then
+    say "$label — SKIPPED, it runs a different install"
+    say "          ($(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null), not $TARGET)"
+    say "          use --force to remove it anyway"
+    found=1
+    continue
+  fi
   loaded=0
   launchctl print "gui/$UID/$label" >/dev/null 2>&1 && loaded=1
   if [ "$loaded" = 0 ] && [ ! -e "$plist" ]; then continue; fi
@@ -93,7 +125,7 @@ for label in "${labels[@]:-}"; do
     say "$label — svc descriptor removed"
   fi
 done
-[ "$found" = 0 ] && say "none installed"
+[ "$found" = 0 ] && [ "$WANT_AGENTS" = 1 ] && say "none installed"
 
 # procwatch is KeepAlive. If bootout raced a respawn, say so rather than
 # leaving a process quietly writing to a store we are about to declare removed.
@@ -105,7 +137,6 @@ fi
 # ---------------------------------------------------------------- executable
 
 step "Removing the executable"
-TARGET="$PREFIX/bin/sysobs"
 if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
   run rm -f "$TARGET"
   say "$TARGET — removed"

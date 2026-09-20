@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    # sysobs reads macOS-only interfaces. There is no point pretending
+    # otherwise on ubuntu — the collectors would all be absent.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: python version
+        run: python3 --version
+
+      - name: shell syntax
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+
+      - name: selftest
+        run: ./bin/sysobs selftest
+
+      - name: install (no agents — CI has no launchd session)
+        run: ./install.sh --no-agents --prefix "$RUNNER_TEMP/prefix" --label-prefix ci.sysobs
+
+      - name: capture a snapshot and verify it
+        env:
+          SYSOBS_HOME: ${{ runner.temp }}/store
+        run: |
+          "$RUNNER_TEMP/prefix/bin/sysobs" snapshot --files none --note ci
+          "$RUNNER_TEMP/prefix/bin/sysobs" list
+          "$RUNNER_TEMP/prefix/bin/sysobs" verify
+          "$RUNNER_TEMP/prefix/bin/sysobs" db
+          "$RUNNER_TEMP/prefix/bin/sysobs" query "select count(*) from snapshot"
+
+      - name: rendered plists are valid
+        run: |
+          for t in contrib/launchd/*.plist.in; do
+            sed -e 's|@LABEL@|ci.sysobs|g' -e 's|@SYSOBS@|/usr/bin/true|g' \
+                -e "s|@STORE@|$RUNNER_TEMP/store|g" -e "s|@LOGDIR@|$RUNNER_TEMP|g" \
+                -e 's|@INTERVAL@|300|g' -e 's|@POLL@|0.1|g' -e 's|@KEEPDAYS@|14|g' \
+                "$t" > "$RUNNER_TEMP/out.plist"
+            plutil -lint "$RUNNER_TEMP/out.plist"
+          done
+
+      - name: rendered svc descriptors are valid json
+        run: |
+          for t in contrib/svc/*.json.in; do
+            sed -e 's|@LABEL@|ci.sysobs|g' -e "s|@SOURCE@|$PWD|g" \
+                -e "s|@STORE@|$RUNNER_TEMP/store|g" -e 's|@INTERVAL@|300|g' \
+                -e 's|@POLL@|0.1|g' -e 's|@KEEPDAYS@|14|g' -e 's|@STALE@|1800|g' \
+                -e 's|@TODAY@|2026-01-01|g' "$t" | python3 -m json.tool > /dev/null
+          done
+
+      - name: uninstall is clean and leaves the store alone
+        env:
+          SYSOBS_HOME: ${{ runner.temp }}/store
+        run: |
+          ./uninstall.sh --prefix "$RUNNER_TEMP/prefix" --label-prefix ci.sysobs
+          test ! -e "$RUNNER_TEMP/prefix/bin/sysobs"
+          test -d "$RUNNER_TEMP/store"
