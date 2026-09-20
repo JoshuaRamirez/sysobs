@@ -12,7 +12,7 @@ jobs:
     # otherwise on ubuntu — the collectors would all be absent.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: python version
         run: python3 --version
