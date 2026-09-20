@@ -97,6 +97,19 @@ sysobs.sqlite            built on demand by `sysobs db`
 
 ## The schema
 
+Nine dimensions, thirteen facts. Mostly a **star** — a dimension is one hop
+from the fact that references it — with one deliberately **snowflaked** arm:
+
+```
+command ──▶ file ──▶ volume
+```
+
+An executable is a file, and a file lives on a volume. Flattening that chain
+would repeat a volume's UUID and mount point on every one of ~18k distinct
+file rows, so it stays normalized and costs one extra join on the rare query
+that needs to get from a command to the disk it came off. Every other
+dimension hangs directly off a fact.
+
 `sysobs schema` prints it; `sysobs schema --ddl` prints the SQL. Two kinds of
 table:
 

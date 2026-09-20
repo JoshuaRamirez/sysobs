@@ -3,10 +3,14 @@
 
 Substrate (derived, never hand-written): ps, lsof, netstat, nettop, top, df,
 iostat, vm_stat, sysctl, and libproc via ctypes. Every snapshot is written as a
-STAR SCHEMA spread over one CSV per table under $SYSOBS_HOME/tables, so nothing
-is stored twice: a file path, an IP address, a port, a volume, an executable
-and an interface each live exactly once in a dimension table and are referenced
-by id from the per-snapshot fact rows.
+DIMENSIONAL SCHEMA spread over one CSV per table under $SYSOBS_HOME/tables,
+so nothing is stored twice: a file path, an IP address, a port, a volume, an
+executable and an interface each live exactly once in a dimension table and are
+referenced by id from the per-snapshot fact rows.
+
+Mostly a star — most dimensions hang one hop off a fact — with one SNOWFLAKED
+arm, command -> file -> volume, because an executable lives on a volume and
+flattening it would repeat a volume UUID and mount point across ~18k files.
 
     sysobs snapshot [--files none|own|all] [--rdns] [--geo online] [--json]
     sysobs watch --interval 60 [--count N]      repeated snapshots

@@ -54,5 +54,5 @@ The release that made it installable by someone other than its author.
 
 ## [0.1.0]
 
-Initial single-file collector: star-schema CSV store, referential integrity
+Initial single-file collector: dimensional CSV store, referential integrity
 checker, SQLite mirror, process start/exit recorder, power telemetry, prune.
