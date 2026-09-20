@@ -1581,6 +1581,23 @@ def _num_cast(col: str):
     return lambda v: v if v not in ("", None) else None
 
 
+def _prefix_sha1(path: Path, size: int | None = None) -> str:
+    """sha1 of the first `size` bytes. Exact, not a heuristic: if the prefix is
+    byte-identical then everything before that offset is unchanged, so the file
+    was appended to and nothing already mirrored was edited."""
+    h = hashlib.sha1()
+    remaining = size
+    with path.open("rb") as fh:
+        while remaining is None or remaining > 0:
+            chunk = fh.read(1 << 20 if remaining is None else min(1 << 20, remaining))
+            if not chunk:
+                break
+            h.update(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
+    return h.hexdigest()
+
+
 def build_db(store: Store, rebuild=False) -> dict:
     path = store.root / "sysobs.sqlite"
     if rebuild and path.exists():
@@ -1591,6 +1608,26 @@ def build_db(store: Store, rebuild=False) -> dict:
     # Facts are append-only, so a rebuild of the whole store on every sync is
     # waste that grows without bound. Load only snapshots the mirror lacks;
     # dimensions are re-upserted because first_seen/last_seen move.
+    con.execute("CREATE TABLE IF NOT EXISTS _mirror_source ("
+                "table_name TEXT PRIMARY KEY, byte_size INTEGER, prefix_sha1 TEXT)")
+
+    def rewritten(name: str, path: Path) -> bool:
+        """Incremental loading skips rows it has already seen — which is right
+        for an append, and silently wrong for a correction to an existing row.
+        A mirror that can never catch up is worse than one that is merely
+        stale, so detect an edit and reload that table in full."""
+        if not path.exists():
+            return False
+        row = con.execute("SELECT byte_size, prefix_sha1 FROM _mirror_source "
+                          "WHERE table_name=?", (name,)).fetchone()
+        if not row:
+            return True
+        size, digest = row
+        if path.stat().st_size < size:
+            return True                      # shrank: cannot be an append
+        return _prefix_sha1(path, size) != digest
+
+    reloaded: list[str] = []
     known: set[str] = set()
     if not rebuild:
         try:
@@ -1603,7 +1640,12 @@ def build_db(store: Store, rebuild=False) -> dict:
     for name in dict.fromkeys(order):
         t = SCHEMA[name]
         rows = store.read(name)
-        if t.kind == "fact" and known and "snapshot_id" in t.columns:
+        edited = (not rebuild) and rewritten(name, t.path)
+        if edited:
+            reloaded.append(name)
+        if edited:
+            pass                             # fall through: load every row
+        elif t.kind == "fact" and known and "snapshot_id" in t.columns:
             rows = [r for r in rows if r.get("snapshot_id") not in known]
         elif t.kind == "fact" and not rebuild and "snapshot_id" not in t.columns:
             # not snapshot-scoped (process_event): resume on its own primary key
@@ -1624,12 +1666,18 @@ def build_db(store: Store, rebuild=False) -> dict:
             loaded[name] = len(payload)
         except sqlite3.IntegrityError as e:
             skipped[name] = str(e)
+    for name, t in SCHEMA.items():
+        if t.path.exists():
+            size = t.path.stat().st_size
+            con.execute("INSERT OR REPLACE INTO _mirror_source VALUES (?,?,?)",
+                        (name, size, _prefix_sha1(t.path, size)))
     con.commit()
     violations = [dict(zip(("table", "rowid", "parent", "fkid"), r))
                   for r in con.execute("PRAGMA foreign_key_check").fetchall()]
     con.close()
     return {"db": str(path), "loaded": loaded, "rejected": skipped,
             "snapshots_already_mirrored": len(known),
+            "reloaded_after_edit": reloaded,
             "foreign_key_violations": violations,
             "ok": not skipped and not violations}
 
@@ -1965,7 +2013,18 @@ class ProcWatch:
             d = self._describe(pid)
             if d:
                 self.live[pid] = d
+        self._bind_parents(self.live.values())
         return len(self.live)
+
+    def _bind_parents(self, records) -> None:
+        """Attach the parent's identity to the child's OWN record, at the moment
+        the child is first seen. Looking it up at exit time cannot work: by then
+        the parent may have exited in the same tick (and been popped), which is
+        exactly the orphan case worth recording."""
+        for d in records:
+            parent = self.live.get(d["ppid"], {})
+            d.setdefault("parent_exe", parent.get("exe", ""))
+            d.setdefault("parent_argv", parent.get("argv", ""))
 
     def tick(self) -> list[dict]:
         now = time.time()
@@ -1976,11 +2035,11 @@ class ProcWatch:
             if not d:                      # gone again already, within the tick
                 continue
             self.live[pid] = d
-            parent = self.live.get(d["ppid"], {})
+            self._bind_parents([d])
             events.append({
                 "ts": _iso_ms(now), "event": "start", "pid": pid, "ppid": d["ppid"],
                 "uid": d["uid"], "exe": d["exe"], "argv": d["argv"],
-                "parent_exe": parent.get("exe", ""), "parent_argv": parent.get("argv", ""),
+                "parent_exe": d["parent_exe"], "parent_argv": d["parent_argv"],
                 "started_at": _iso_ms(d["start"]), "lifetime_ms": "",
                 "source": self.source,
             })
@@ -1989,7 +2048,8 @@ class ProcWatch:
             events.append({
                 "ts": _iso_ms(now), "event": "exit", "pid": pid, "ppid": d["ppid"],
                 "uid": d["uid"], "exe": d["exe"], "argv": d["argv"],
-                "parent_exe": "", "parent_argv": "",
+                "parent_exe": d.get("parent_exe", ""),
+                "parent_argv": d.get("parent_argv", ""),
                 "started_at": _iso_ms(d["start"]),
                 "lifetime_ms": int(max(now - d["start"], 0) * 1000),
                 "source": self.source,
@@ -2241,6 +2301,26 @@ def selftest() -> int:
             check("incremental loads only the new snapshot",
                   inc["loaded"].get("process"), 1)
             check("sync clears staleness", db_is_stale(Store(Path(tmp))), False)
+
+            # An EDIT to an already-mirrored row, not an append. Incremental
+            # loading skipped these forever: the mirror could not catch up even
+            # though it no longer looked stale.
+            st7 = Store(Path(tmp))
+            prows = st7.read("process")
+            prows[0]["username"] = "edited-in-place"
+            st7.replace("process", prows)
+            rep7 = build_db(Store(Path(tmp)))
+            check("edit is recognised as a rewrite, not an append",
+                  "process" in rep7["reloaded_after_edit"], True)
+            con7 = sqlite3.connect(Path(tmp) / "sysobs.sqlite")
+            got7 = con7.execute(
+                "SELECT username FROM process WHERE snapshot_id=? AND pid=?",
+                (prows[0]["snapshot_id"], int(prows[0]["pid"]))).fetchone()
+            con7.close()
+            check("an edited row reaches the mirror without --rebuild",
+                  got7[0] if got7 else None, "edited-in-place")
+            check("a pure append is still incremental",
+                  build_db(Store(Path(tmp)))["reloaded_after_edit"], [])
         finally:
             TABLES = saved_tables
 
@@ -2291,6 +2371,10 @@ def selftest() -> int:
                       300 <= int(exited[0]["lifetime_ms"]) <= 2000, True)
                 check("start and exit share one identity",
                       started[0]["started_at"] == exited[0]["started_at"], True)
+                check("exit carries the parent it was born with",
+                      bool(exited[0]["parent_exe"]), True)
+                check("exit names the SAME parent the start did",
+                      exited[0]["parent_exe"], started[0]["parent_exe"])
 
             spool_write(started + exited)
             ing = ingest_spool(st, Refs(st, now_iso()))
@@ -2303,6 +2387,16 @@ def selftest() -> int:
                   len({r["text"] for r in Store(Path(tmp)).read("argv")}),
                   len(Store(Path(tmp)).read("argv")))
             check("events are on record", len(Store(Path(tmp)).read("process_event")), 2)
+            # the view used to backfill the parent at render time while the
+            # table stored nothing: every SQL question about exits lost it
+            stored_exit = next(r for r in Store(Path(tmp)).read("process_event")
+                               if r["event"] == "exit")
+            check("STORED exit row has a parent, not just the rendered one",
+                  bool(stored_exit["parent_command_id"]), True)
+            stored_start = next(r for r in Store(Path(tmp)).read("process_event")
+                                if r["event"] == "start")
+            check("table agrees with itself across start and exit",
+                  stored_exit["parent_command_id"], stored_start["parent_command_id"])
 
             again = ingest_spool(Store(Path(tmp)), Refs(st, now_iso()))
             check("re-ingest is a no-op (offset held)", again["events"], 0)
@@ -2336,7 +2430,7 @@ def selftest() -> int:
 
     for line in fails:
         print(f"FAIL {line}")
-    total = 64
+    total = 71
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
