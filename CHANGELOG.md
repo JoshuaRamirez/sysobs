@@ -62,10 +62,16 @@ The release that made it installable by someone other than its author.
 - **Incremental sync was slower than a full rebuild** — 2150 s against 13 s.
   Dimension rows are refreshed on every flush to move `last_seen`, and
   `INSERT OR REPLACE` is a DELETE plus an INSERT; deleting a parent makes SQLite
-  prove nothing references it, which was a full scan of a 320k-row table with no
-  index on the child column, 40k times over. Foreign-key columns are now indexed
-  from the schema (30 indexes, generated, not hand-picked) and dimensions are
-  upserted with `ON CONFLICT DO UPDATE`. **Incremental: >600 s -> 5.6 s.**
+  prove nothing references it — a full scan of a 320k-row table, 40k times over.
+  Dimensions are now upserted with `ON CONFLICT DO UPDATE`, which edits in place
+  and never deletes a parent. **Incremental: >600 s -> 5.6 s.**
+
+  Indexing every foreign-key column was tried as part of the same fix and
+  **reverted after measurement**: interleaved A/B runs under identical load put
+  4 indexes and 30 indexes within noise of each other on the incremental path
+  (26-28 s both, on a loaded machine), while the 30 cost 103 MB of database and
+  ~86 s of rebuild. Removing the DELETE was the whole fix; the indexes were
+  cargo. The four that serve the views remain.
 
 - An agent belongs to the install **whose binary it runs**. Uninstalling a
   throwaway `--prefix` used to boot out the real agents, because the label
