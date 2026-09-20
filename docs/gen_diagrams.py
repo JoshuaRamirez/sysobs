@@ -1180,7 +1180,7 @@ def d6_components():
     agents = [("local.sysobs", "snapshot --files none", "StartInterval 300 s · RunAtLoad", 100),
               ("local.sysobs-procwatch", "procwatch", "RunAtLoad · KeepAlive", 186),
               ("local.sysobs-prune", "prune --days 14 --go", "StartCalendarInterval Sun 04:15", 272),
-              ("local.example-agent", "setenv OLLAMA_MAX_LOADED_MODELS 1", "RunAtLoad · one-shot", 358)]
+              ("local.example-agent", "setenv SOME_VAR 1", "RunAtLoad · one-shot", 358)]
     for name, cmd, when, y in agents:
         _comp(s, 40, y, 420, 74, name, None, "ctrl")
         s.text(56, y + 44, cmd, 9.5, MUTE, "start", 400, family="ui-monospace,Menlo,monospace")

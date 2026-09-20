@@ -29,10 +29,35 @@ sysobs db && sysobs query "..." # SQL, with the FKs enforced by SQLite
 
 ## Install
 
+macOS, python3 ≥ 3.9, no third-party packages. `sysobs` is one file.
+
 ```sh
-ln -s ~/Developer/sysobs/bin/sysobs ~/.local/bin/sysobs
-sysobs selftest
+git clone https://github.com/JoshuaRamirez/sysobs.git
+cd sysobs
+./install.sh
 ```
+
+That puts `sysobs` on your PATH and loads three launchd agents — snapshot,
+procwatch, prune. The installer runs `selftest` first and refuses to install
+if it fails, rather than scheduling a job that breaks every five minutes.
+`./install.sh --dry-run` prints what it would do and changes nothing.
+
+```sh
+./install.sh --interval 60          # snapshot every minute instead of five
+./install.sh --store /Volumes/big/sysobs
+./install.sh --no-agents            # the command only, no background jobs
+./install.sh --copy                 # copy the script instead of symlinking
+```
+
+To remove it:
+
+```sh
+./uninstall.sh                      # agents and command go; DATA STAYS
+./uninstall.sh --purge              # ...and delete the store (asks first)
+```
+
+Without `--purge` this is reversible: re-run `./install.sh` and collection
+resumes on the same store, with referential integrity intact.
 
 Data lands in `$SYSOBS_HOME`, default `~/.local/state/sysobs`:
 
@@ -170,11 +195,8 @@ sysobs events --since 2h --json        # --no-ingest to read only what is stored
 
 Install it as an always-on agent:
 
-```sh
-sed "s|__HOME__|$HOME|g" contrib/local.sysobs-procwatch.plist \
-  > ~/Library/LaunchAgents/local.sysobs-procwatch.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.sysobs-procwatch.plist
-```
+`./install.sh` already did this. It runs as `local.sysobs-procwatch`, with
+`KeepAlive`, so it comes back after a crash or a reboot.
 
 Four properties worth knowing:
 
@@ -262,12 +284,11 @@ Two kinds, both normalized:
 sysobs watch --interval 300            # foreground
 ```
 
-Or install the launchd agent template (`contrib/local.sysobs.plist`):
+Or leave it to launchd — `./install.sh` installs it as `local.sysobs`,
+rendered from `contrib/launchd/snapshot.plist.in`:
 
 ```sh
-sed "s|__HOME__|$HOME|g" contrib/local.sysobs.plist \
-  > ~/Library/LaunchAgents/local.sysobs.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.sysobs.plist
+./install.sh --interval 300            # the default
 ```
 
 A snapshot with `--files own` costs roughly 20–40 s and ~4 MB of CSV; with
@@ -276,15 +297,21 @@ A snapshot with `--files own` costs roughly 20–40 s and ~4 MB of CSV; with
 Three agents make up the running system, and they are deliberately separable —
 each is useful without the others:
 
-| agent | plist | what it does |
+| agent | template | what it does |
 |---|---|---|
-| `local.sysobs` | `contrib/local.sysobs.plist` | a snapshot every 5 min, and the **only writer** of the tables — it also folds in procwatch's spool |
-| `local.sysobs-procwatch` | `contrib/local.sysobs-procwatch.plist` | the always-on start/exit recorder; `KeepAlive`, so it comes back |
-| `local.sysobs-prune` | — | weekly `prune --days 14 --event-days 3 --go` |
+| `local.sysobs` | `contrib/launchd/snapshot.plist.in` | a snapshot every 5 min, and the **only writer** of the tables — it also folds in procwatch's spool |
+| `local.sysobs-procwatch` | `contrib/launchd/procwatch.plist.in` | the always-on start/exit recorder; `KeepAlive`, so it comes back |
+| `local.sysobs-prune` | `contrib/launchd/prune.plist.in` | weekly `prune --days 14 --go` |
 
-On this machine they are registered with `svc`, so `svc show sysobs`,
-`svc logs sysobs-procwatch` and `svc health` work; that is local convenience,
-not a dependency.
+Install any subset by hand if you want fewer: render the template you want,
+`launchctl bootstrap` it, and skip the rest. `./install.sh --no-agents`
+installs the executable alone.
+
+If `svc` is on the machine, the
+installer also writes descriptors from `contrib/svc/*.json.in`, so
+`svc show sysobs`, `svc logs sysobs-procwatch` and `svc health` work. That is
+local convenience, not a dependency — it is skipped silently when `svc` is
+absent.
 
 ## Known asymmetry
 
