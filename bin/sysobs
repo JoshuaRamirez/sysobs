@@ -1660,6 +1660,21 @@ def build_db(store: Store, rebuild=False) -> dict:
             return True                      # shrank: cannot be an append
         return _prefix_sha1(path, size) != digest
 
+    # The store has exactly one writer, and it rewrites dimension tables WHOLE.
+    # Reading table by table without the lock gives a torn read: argv as it was
+    # before a flush, process_event as it is after, and events referencing argv
+    # ids that the mirror has never seen. That is precisely how this surfaced —
+    # "REJECTED process_event: FOREIGN KEY constraint failed" against a store
+    # whose CSVs verify clean.
+    #
+    # Hold the lock for the READ only. Loading into SQLite is the slow part
+    # (tens of minutes on a large store) and needs no lock, so the writer is
+    # blocked for the read alone.
+    snap: dict[str, list[dict]] = {}
+    with StoreLock():
+        for _n in SCHEMA:
+            snap[_n] = store.read(_n)
+
     reloaded: list[str] = []
     known: set[str] = set()
     if not rebuild:
@@ -1672,7 +1687,7 @@ def build_db(store: Store, rebuild=False) -> dict:
     order += [n for n, t in SCHEMA.items() if t.kind == "fact" and n != "snapshot"]
     for name in dict.fromkeys(order):
         t = SCHEMA[name]
-        rows = store.read(name)
+        rows = snap[name]
         edited = (not rebuild) and rewritten(name, t.path)
         if edited:
             reloaded.append(name)
@@ -1694,11 +1709,25 @@ def build_db(store: Store, rebuild=False) -> dict:
         casts = [(_num_cast(c)) for c in t.columns]
         payload = [tuple(cast(r.get(c, "")) for c, cast in zip(t.columns, casts))
                    for r in rows]
+        sql = f"INSERT OR REPLACE INTO {name} ({cols}) VALUES ({marks})"
         try:
-            con.executemany(f"INSERT OR REPLACE INTO {name} ({cols}) VALUES ({marks})", payload)
+            con.executemany(sql, payload)
             loaded[name] = len(payload)
         except sqlite3.IntegrityError as e:
-            skipped[name] = str(e)
+            # executemany is one statement: a single offending row rolls back
+            # every good row with it, so 300k valid events can vanish behind
+            # one bad reference. Retry row by row, keep what is sound, and
+            # report exactly how many were not.
+            good = bad = 0
+            first = str(e)
+            for row in payload:
+                try:
+                    con.execute(sql, row)
+                    good += 1
+                except sqlite3.IntegrityError:
+                    bad += 1
+            loaded[name] = good
+            skipped[name] = f"{bad} row(s) rejected, {good} loaded — first: {first}"
     for name, t in SCHEMA.items():
         if t.path.exists():
             size = t.path.stat().st_size
@@ -2559,9 +2588,36 @@ def selftest() -> int:
     check("full_days cannot exceed days",
           len(plan_retention(minutes, now, days=1, full_days=9)[0]), 1441)
 
+    # ---- one bad reference must not take a whole table with it. This is the
+    # shape of a real failure: the mirror rejected 300k sound process_event
+    # rows because executemany is a single statement and one row dangled.
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = (SPOOL, OFFSETS, LOCK, TABLES)
+        try:
+            SPOOL, OFFSETS, LOCK = (Path(tmp) / "spool", Path(tmp) / "spool" / "offsets.json",
+                                    Path(tmp) / ".lock")
+            TABLES = Path(tmp) / "tables"
+            st = Store(Path(tmp))
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_snapshot(argparse.Namespace(files="none", rdns=False, geo="off",
+                                                json=False, note="fixture"))
+            ev = st.read("process_event")
+            good = len(ev)
+            ev.append({**(ev[0] if ev else {}), "event_id": "e_dangling",
+                       "command_id": "g_does_not_exist"})
+            st.replace("process_event", ev)
+            rep = build_db(Store(Path(tmp)), rebuild=True)
+            check("one dangling row does not discard the table",
+                  rep["loaded"].get("process_event", 0), good)
+            check("and the rejection is reported",
+                  "rejected" in rep and "process_event" in rep["rejected"], True)
+        finally:
+            SPOOL, OFFSETS, LOCK, TABLES = saved
+
     for line in fails:
         print(f"FAIL {line}")
-    total = 85
+    total = 87
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
