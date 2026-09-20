@@ -53,6 +53,11 @@ from pathlib import Path
 VERSION = "0.2.0"
 SCHEMA_VERSION = 1
 
+# On AC, the battery discharging means the adapter could not cover demand.
+# Below these it is noise rather than starvation — see the power collector.
+BATTERY_DEFICIT_MA = -250      # a deficit worth calling one (~3W)
+HEADROOM_TIGHT_MW = 5000       # adapter effectively exhausted
+
 HOME = Path.home()
 ROOT = Path(os.environ.get(
     "SYSOBS_HOME",
@@ -914,9 +919,19 @@ class Capture:
         # Trust the current, not the power field: with a 140W supply and the
         # battery charging at +6110mA, PowerTelemetryData still reported
         # BatteryPower=-522mW. InstantAmperage matched reality in both the
-        # starved (-33mA on AC) and the recovered state, so it decides.
+        # starved and the recovered state, so it decides.
+        #
+        # But a NEGATIVE current alone does not mean starved. The battery only
+        # covers a deficit the adapter cannot, so a few tens of mA alongside
+        # 50W+ of untouched headroom is measurement noise. Measured over 68
+        # such samples: 39 sat between 0 and -20mA with a minimum of 56W
+        # headroom, while the two genuinely starved ones drew past -500mA with
+        # headroom GONE (-3.0W). Require the two signals to agree: a deficit
+        # big enough to mean something, or headroom actually exhausted.
         if isinstance(ba, int) and ba < 0 and external:
-            capped = 1
+            if ba <= BATTERY_DEFICIT_MA or (headroom is not None
+                                            and headroom <= HEADROOM_TIGHT_MW):
+                capped = 1
         desc = re.search(r'"Description"="([^"]+)"', out)
         self.s.fact("power_sample", {
             "snapshot_id": self.sid, "adapter_watts": watts,
@@ -2657,9 +2672,22 @@ def selftest() -> int:
           ("INSERT OR REPLACE INTO {name}" not in _bsrc
            and "ON CONFLICT(" in _bsrc), True)
 
+    # ---- power capping: the battery trickling a few mA while 100W of adapter
+    # headroom sits unused is noise, not starvation. Real cases from the store.
+    def _capped(ba, headroom_mw):
+        if ba < 0:
+            return int(ba <= BATTERY_DEFICIT_MA or headroom_mw <= HEADROOM_TIGHT_MW)
+        return 0
+    check("real starvation: -1330mA, headroom gone", _capped(-1330, -3000), 1)
+    check("real deficit: -707mA", _capped(-707, 14200), 1)
+    check("headroom exhausted even at small draw", _capped(-40, 1000), 1)
+    check("noise: -10mA with 103W headroom", _capped(-10, 103800), 0)
+    check("noise: -21mA with 70W headroom", _capped(-21, 70200), 0)
+    check("charging is never capped", _capped(6110, 20000), 0)
+
     for line in fails:
         print(f"FAIL {line}")
-    total = 89
+    total = 95
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
