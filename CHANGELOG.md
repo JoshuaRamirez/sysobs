@@ -51,6 +51,22 @@ The release that made it installable by someone other than its author.
 
 ### Fixed
 
+- **`sysobs db` read the store without the lock.** It reads table by table while
+  the single writer rewrites dimension tables whole, so a flush landing mid-read
+  produced a torn view and the mirror rejected `process_event` rows referencing
+  `argv` ids it had never seen — against CSVs that verified clean. The read now
+  happens under the lock; the slow SQLite load does not.
+- **A single bad row discarded its whole table.** `executemany` is one
+  statement, so one dangling reference rolled back 300k sound rows with it. It
+  now retries row by row and reports the count rejected.
+- **Incremental sync was slower than a full rebuild** — 2150 s against 13 s.
+  Dimension rows are refreshed on every flush to move `last_seen`, and
+  `INSERT OR REPLACE` is a DELETE plus an INSERT; deleting a parent makes SQLite
+  prove nothing references it, which was a full scan of a 320k-row table with no
+  index on the child column, 40k times over. Foreign-key columns are now indexed
+  from the schema (30 indexes, generated, not hand-picked) and dimensions are
+  upserted with `ON CONFLICT DO UPDATE`. **Incremental: >600 s -> 5.6 s.**
+
 - An agent belongs to the install **whose binary it runs**. Uninstalling a
   throwaway `--prefix` used to boot out the real agents, because the label
   prefix matched even though the executable did not. Both scripts now compare

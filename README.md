@@ -197,6 +197,11 @@ the integrity checker are all generated from it, so they cannot drift apart.
 then runs `PRAGMA foreign_key_check`, so the database independently confirms
 what `verify` claims.
 
+Sizing it: a full `--rebuild` of a 526-snapshot, 686 MB store takes about
+**29 s**; an incremental sync on the same store takes about **6 s**. The mirror
+is derived and cheap to throw away, so it is never the thing that bounds how
+much history you keep.
+
 The mirror is incremental but not credulous. Loading only unseen rows is right
 for an append and silently wrong for a *correction*: a mirror that can never
 catch up is worse than one that is merely stale. Each table's byte size and the
