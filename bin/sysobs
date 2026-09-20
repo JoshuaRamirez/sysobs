@@ -57,6 +57,34 @@ ROOT = Path(os.environ.get(
 TABLES = ROOT / "tables"
 DB_PATH = ROOT / "sysobs.sqlite"
 
+# The store records every command line on the machine, and command lines are
+# where secrets leak: `mysql -pHUNTER2`, `curl -H "Authorization: Bearer ..."`,
+# an API key passed as a flag. On a shared machine a world-readable store hands
+# all of that to any local account. Nothing sysobs writes is readable by anyone
+# but its owner — umask covers files created from here on, harden_store() fixes
+# a store created before this was true.
+os.umask(0o077)
+
+
+def harden_store(root: Path = ROOT) -> list[Path]:
+    """Restrict the store to its owner. Returns what it had to change, so
+    `sysobs verify` can report a store that was exposed rather than silently
+    repairing it. Idempotent and cheap: a few dozen stat calls."""
+    changed = []
+    if not root.exists():
+        return changed
+    targets = [root] + [p for p in root.rglob("*")]
+    for p in targets:
+        try:
+            mode = p.stat().st_mode & 0o777
+            want = 0o700 if p.is_dir() else 0o600
+            if mode & 0o077:
+                p.chmod(want)
+                changed.append(p)
+        except OSError:
+            continue  # a file that vanished mid-walk is not an error
+    return changed
+
 csv.field_size_limit(16 * 1024 * 1024)
 
 
@@ -455,6 +483,7 @@ class Store:
         self.root = root or ROOT
         self.tables = self.root / "tables"
         self.tables.mkdir(parents=True, exist_ok=True)
+        harden_store(self.root)
         self.dims: dict[str, dict[str, dict]] = {}
         self.pending: dict[str, list[dict]] = {}
 
@@ -2428,9 +2457,24 @@ def selftest() -> int:
         finally:
             SPOOL, OFFSETS, LOCK, TABLES = saved
 
+    # ---- the store must never be readable beyond its owner: it holds every
+    # command line on the machine, and command lines carry secrets.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "store"
+        (root / "tables").mkdir(parents=True)
+        leaky = root / "tables" / "argv.csv"
+        leaky.write_text("argv_id,argv\n1,mysql -pHUNTER2\n")
+        leaky.chmod(0o644)
+        root.chmod(0o755)
+        fixed = harden_store(root)
+        check("harden repairs a world-readable file", leaky.stat().st_mode & 0o077, 0)
+        check("harden repairs a world-readable dir", root.stat().st_mode & 0o077, 0)
+        check("harden reports what it changed", leaky in fixed, True)
+        check("harden is idempotent", harden_store(root), [])
+
     for line in fails:
         print(f"FAIL {line}")
-    total = 71
+    total = 75
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
@@ -2543,7 +2587,11 @@ def _procwatch_running() -> bool:
 
 
 def cmd_verify(args) -> int:
+    # Harden BEFORE Store() does it silently, so an exposed store is reported
+    # to the operator once rather than quietly fixed every run.
+    exposed = harden_store()
     report = verify(Store())
+    report["permissions_repaired"] = [str(p) for p in exposed]
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -2552,6 +2600,12 @@ def cmd_verify(args) -> int:
         for name, count in sorted(report["tables"].items(), key=lambda kv: -kv[1]):
             if count:
                 print(f"  {name:<22} {count:>9}")
+        if exposed:
+            print(f"\n  note [permissions] {len(exposed)} path(s) were readable "
+                  f"beyond their owner and have been restricted to 0600/0700.")
+            print( "       The store holds every command line on this machine.")
+            for s in exposed[:3]:
+                print(f"       {s}")
         if not report["findings"]:
             print("\nreferential integrity: clean")
         else:
