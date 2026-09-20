@@ -14,10 +14,15 @@ table and are referenced by id from the per-snapshot fact rows. Two hundred
 processes with the same dylib open produce one `file` row and two hundred
 `process_file` edges.
 
+Two recorders share that store. `snapshot` answers *what is true right now*;
+`procwatch` answers *what happened in between* — every process start and exit,
+with the parent that launched it.
+
 ```
-sysobs snapshot                 # capture
+sysobs snapshot                 # capture an instant
 sysobs show                     # read the latest one back
 sysobs top --by net             # heaviest processes
+sysobs events --since 1h        # what started and stopped since
 sysobs verify                   # every reference resolves?
 sysobs db && sysobs query "..." # SQL, with the FKs enforced by SQLite
 ```
@@ -32,8 +37,11 @@ sysobs selftest
 Data lands in `$SYSOBS_HOME`, default `~/.local/state/sysobs`:
 
 ```
-tables/<table>.csv     one file per table, append-only for facts
-sysobs.sqlite          built on demand by `sysobs db`
+tables/<table>.csv       one file per table, append-only for facts
+spool/procwatch-*.ndjson process events, hourly, awaiting ingestion
+spool/offsets.json       how far each spool file has been folded in
+.store.lock              held by whoever is writing the tables
+sysobs.sqlite            built on demand by `sysobs db`
 ```
 
 ## The schema
@@ -55,7 +63,8 @@ table:
 | `ip_address` | an address, with offline scope, optional rDNS and optional geo |
 | `port` | a protocol/port pair, named from `/etc/services` |
 
-**Facts** are written once per snapshot and point at the dimensions.
+**Facts** point at the dimensions. Most are written once per snapshot;
+`process_event` is written once per *event*, whenever it happened.
 
 | table | grain |
 |---|---|
@@ -67,7 +76,7 @@ table:
 | `process_net_sample` | bytes in and out per pid (`nettop`) |
 | `process_file` | pid → fd → file location |
 | `socket` | pid → fd → protocol, both addresses, both ports, state, bytes |
-| `process_event` | a start or exit seen *between* snapshots, with its parent |
+| `process_event` | one process start or exit, with the command, the command line and the parent it was launched from |
 | `volume_sample` | disk usage per volume |
 | `disk_io_sample` | throughput per device |
 | `interface_sample` | packets and bytes per interface |
@@ -113,6 +122,10 @@ the integrity checker are all generated from it, so they cannot drift apart.
   nothing is a defect)
 - composite parents: every `process_sample`, `process_file`, `socket` and
   `process_net_sample` row has its `process` row *in the same snapshot*
+- a column declared numeric parses as a number. Width-correct rows can still be
+  shifted one column to the left — which is what an appending writer and a
+  file that disagree about the schema produce — and every key and foreign-key
+  check above passes while the data means nothing
 - `last_seen` never precedes `first_seen`
 - every snapshot has the rows that make it usable
 
@@ -120,28 +133,39 @@ the integrity checker are all generated from it, so they cannot drift apart.
 then runs `PRAGMA foreign_key_check`, so the database independently confirms
 what `verify` claims.
 
+The mirror is incremental but not credulous. Loading only unseen rows is right
+for an append and silently wrong for a *correction*: a mirror that can never
+catch up is worse than one that is merely stale. Each table's byte size and the
+sha1 of its prefix up to that size are recorded in `_mirror_source`; an
+identical prefix proves nothing before that offset changed, so the table was
+appended to. A differing prefix means a row was edited and that table reloads
+in full. `sysobs query` syncs first unless given `--no-sync`.
+
 Collectors enforce this at write time rather than repairing it afterwards: a
 `nettop`, `lsof` or `netstat` row whose pid is not in this snapshot (processes
 start and exit between collectors) is dropped, and the drop is *counted in
 `collector_run`* rather than silently discarded.
 
-`sysobs prune --days N --go` drops old snapshots and then garbage-collects
-dimension rows nothing points at any more, in dependency order, so the store
-never passes through a state where a reference dangles.
+`sysobs prune --days N [--event-days N] --go` drops old snapshots — and
+process events on their own, shorter clock — then garbage-collects dimension
+rows nothing points at any more, in dependency order, so the store never
+passes through a state where a reference dangles.
 
 ## Between snapshots: process starts and exits
 
 A snapshot every five minutes cannot see a process that lived for three
-seconds — so it cannot answer *"what just opened a Java icon, and who
-launched it?"*. `procwatch` closes that gap: it polls the pid list ten times a
-second and records each **start** and **exit** with pid, ppid, uid,
-executable, argv, **the parent's argv**, and how long the process lived.
+seconds — so it cannot answer *"what just opened a Java icon, and who launched
+it?"*. `procwatch` closes that gap: it polls the pid list ten times a second
+(~0.1 ms a pass, ~0.3% of one core, 30–50 MB resident) and records each
+**start** and **exit** with pid, ppid, uid, executable, command line, the
+**parent it was launched from**, and how long it lived.
 
 ```sh
-sysobs procwatch                       # foreground, ~0.3% of one core
+sysobs procwatch                       # foreground
 sysobs events --since 1h               # what started and stopped
 sysobs events --match java             # ...matching a command, argv or parent
 sysobs events --event exit -n 20
+sysobs events --since 2h --json        # --no-ingest to read only what is stored
 ```
 
 Install it as an always-on agent:
@@ -152,32 +176,57 @@ sed "s|__HOME__|$HOME|g" contrib/local.sysobs-procwatch.plist \
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.sysobs-procwatch.plist
 ```
 
-Three properties worth knowing:
+Four properties worth knowing:
 
 - **It is not the store's writer.** Dimension tables are rewritten whole on
   every flush, so a second writer would silently drop the first one's rows.
-  `procwatch` appends to `spool/procwatch-<day>.ndjson`; the snapshot job folds
-  the spool into `process_event` under a lock, resuming from a byte offset and
-  deduping on `event_id`. A stopped procwatch degrades to *events arrive late*,
-  never to *the store is corrupt*. `sysobs events` also ingests, so it never
-  makes you wait for the next snapshot.
+  `procwatch` appends to `spool/procwatch-<hour>.ndjson`; the snapshot job
+  folds the spool into `process_event` under `.store.lock`, resuming from a
+  byte offset and deduping on `event_id`. A stopped procwatch degrades to
+  *events arrive late*, never to *the store is corrupt*. `sysobs events`
+  ingests too, so reading never waits for the next snapshot.
 - **Identity is (pid, start time)**, because pids are reused and start times
   are not. "exit" means *left the process table*, so a zombie's lifetime
   includes the wait for its parent to reap it.
-- **It is bounded on disk.** Events arrive at 200–800 a minute, so raw they
-  would cost ~300 MB a day. Command lines repeat hard — 11k events carried
-  1.8k distinct ones — so `argv` is a dimension and the fact row is a
-  reference, which is the same rule the rest of the schema follows. Spool
-  files are hourly and deleted once fully ingested and a few hours old;
-  `sysobs prune --days 14 --event-days 3` keeps events on their own, much
-  shorter clock than snapshots.
+- **The parent is bound when the child is first seen, not when it exits.** By
+  exit time the parent may be gone — often in the same tick — and that orphan
+  case is exactly the one worth recording. Resolving it at render time instead
+  would make `sysobs events` look right while every SQL question about exits
+  silently lost attribution.
+- **Both the spool and the table are bounded**, because this recorder produces
+  hundreds of rows a minute against the snapshot job's one every five.
+  Spool files rotate hourly and are deleted once fully ingested and a few
+  hours old — the spool is a transfer buffer, not an archive.
+  `sysobs prune --days 14 --event-days 3 --go` then keeps events on their own,
+  much shorter clock than snapshots, and garbage-collects the `argv` and
+  `command` rows nothing points at any more.
 
-Blind spot, stated rather than hidden: a process shorter than the poll
-interval may be missed, and each event records the interval that saw it in
-`source` (`procwatch-100ms`). A real `java -version` lives ~20 ms and is a coin
-flip; anything that draws a window lives far longer and is always caught.
-Exact capture of every exec would need `/usr/bin/eslogger`, which requires a
-root LaunchDaemon and a Full Disk Access grant.
+### What it actually costs
+
+Measured over seven hours on a busy workstation (Chrome, a Node toolchain,
+several Claude Code sessions):
+
+| | rate | at rest |
+|---|---|---|
+| events | 200–800 a minute, ~115k in 7 h | `process_event.csv` ≈ 2.7 MB/hour |
+| command lines | ~18k distinct, averaging 732 characters | `argv.csv` ≈ 2 MB/hour |
+| spool | ~12 MB/hour raw NDJSON | deleted 6 h after ingestion |
+
+Normalizing command lines into the `argv` dimension cut the fact rows by more
+than half — but be honest about the limit: **`argv` does not saturate.** 18,424
+rows held 18,424 distinct strings, because Chrome helpers and shell wrappers
+embed pids, ports and handles that differ on every launch. Dedup pays for
+`sleep 0.2` and for login shells, not for Chrome. Budget roughly **5 MB an
+hour**, or ~350 MB standing at three-day retention.
+
+### The blind spot, stated rather than hidden
+
+A process shorter than the poll interval can be missed, so every row records
+the interval that saw it in `source` (`procwatch-100ms`). A real `java
+-version` lives ~20 ms and is a coin flip; anything that draws a window lives
+far longer and is always caught. Exact capture of every exec would need
+`/usr/bin/eslogger`, which requires a root LaunchDaemon and a Full Disk Access
+grant — a different trust decision, not just a bigger number.
 
 ## What it cannot see, and says so
 
@@ -224,10 +273,50 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.sysobs.plist
 A snapshot with `--files own` costs roughly 20–40 s and ~4 MB of CSV; with
 `--files none`, a few seconds and ~250 KB. Pair it with `sysobs prune`.
 
+Three agents make up the running system, and they are deliberately separable —
+each is useful without the others:
+
+| agent | plist | what it does |
+|---|---|---|
+| `local.sysobs` | `contrib/local.sysobs.plist` | a snapshot every 5 min, and the **only writer** of the tables — it also folds in procwatch's spool |
+| `local.sysobs-procwatch` | `contrib/local.sysobs-procwatch.plist` | the always-on start/exit recorder; `KeepAlive`, so it comes back |
+| `local.sysobs-prune` | — | weekly `prune --days 14 --event-days 3 --go` |
+
+On this machine they are registered with `svc`, so `svc show sysobs`,
+`svc logs sysobs-procwatch` and `svc health` work; that is local convenience,
+not a dependency.
+
+## Known asymmetry
+
+`process.argv` is still stored inline, one copy per process per snapshot, which
+is why `process.csv` is the largest table in the store (62 MB against
+`process_event.csv`'s 19 MB for many more rows). The `argv` dimension that
+`process_event` uses was added later and `process` has not been migrated onto
+it. Doing so is a schema change plus a rewrite of the existing CSV, worth doing
+deliberately rather than opportunistically — the last in-place migration here
+was performed while the 5-minute agent was running the same script and wrote a
+few hundred column-shifted rows. Stop the agent first, or write through the
+tool under `.store.lock`.
+
 ## Selftest
 
-`sysobs selftest` pins the parsers for the output formats this tool does not
-own — `ps` elapsed and CPU times, `top` size suffixes, `lsof` and `netstat`
-endpoint spellings, `netstat -anv` rows whose process name contains spaces —
-and round-trips a small store through `verify` and SQLite, deliberately
-breaking a foreign key and an orphaned fact to confirm both are caught.
+`sysobs selftest` runs 71 fixtures in a temporary store, no privileges and no
+network. They cover the places this tool breaks quietly rather than the places
+it is obviously right:
+
+- the output formats it does not own — `ps` elapsed and CPU times, `top` size
+  suffixes, `lsof` and `netstat` endpoint spellings, `netstat -anv` rows whose
+  process name contains spaces, and the unsigned 64-bit wrap in battery current
+- the kernel calls procwatch depends on: `KERN_PROCARGS2` argv parsing, and
+  that ppid, uid and start time are readable for a **root-owned** process, so a
+  daemon's children are not invisible
+- procwatch against a real process: spawn one that lives 0.35 s, confirm the
+  start *and* the exit are caught, that they share one identity, and that the
+  parent is recorded
+- the store's failure modes, by causing them: a dangling foreign key, an
+  orphaned fact, a row shifted one column left, a re-ingest that must not
+  duplicate, a spool replayed with its offset deleted, an in-place edit that
+  must reach the mirror without `--rebuild`, and a pure append that must still
+  load incrementally
+
+Run it after every change; it is the contract, not a smoke test.
