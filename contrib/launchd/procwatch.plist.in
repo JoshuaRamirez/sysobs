@@ -2,19 +2,23 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key>              <string>local.sysobs-procwatch</string>
+  <key>Label</key>              <string>@LABEL@</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/you/Developer/sysobs/bin/sysobs</string>
+    <string>@SYSOBS@</string>
     <string>procwatch</string>
-    <string>--interval</string><string>0.1</string>
+    <string>--interval</string><string>@POLL@</string>
     <string>--quiet</string>
   </array>
   <key>RunAtLoad</key>          <true/>
   <key>KeepAlive</key>          <true/>
   <key>ThrottleInterval</key>   <integer>10</integer>
   <key>ProcessType</key>        <string>Interactive</string>
-  <key>StandardOutPath</key>    <string>/Users/you/Library/Logs/sysobs-procwatch.log</string>
-  <key>StandardErrorPath</key>  <string>/Users/you/Library/Logs/sysobs-procwatch.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SYSOBS_HOME</key>      <string>@STORE@</string>
+  </dict>
+  <key>StandardOutPath</key>    <string>@LOGDIR@/sysobs-procwatch.log</string>
+  <key>StandardErrorPath</key>  <string>@LOGDIR@/sysobs-procwatch.log</string>
 </dict>
 </plist>

@@ -1,0 +1,12 @@
+{
+  "label": "@LABEL@",
+  "name": "sysobs-prune",
+  "purpose": "Sundays 04:15: drop snapshots older than @KEEPDAYS@ days from @STORE@, then drop any dimension row no surviving fact still references — so the store stays bounded WITHOUT breaking referential integrity. Dry-run by hand with `sysobs prune --days N` (no --go). Verify after with `sysobs verify`.",
+  "source": "@SOURCE@",
+  "docs": "@SOURCE@/README.md",
+  "health": {
+    "cmd": "test -f @STORE@/tables/snapshot.csv"
+  },
+  "manage": {},
+  "registered_at": "@TODAY@"
+}

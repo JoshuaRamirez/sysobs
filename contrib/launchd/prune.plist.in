@@ -2,12 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key>              <string>local.sysobs-prune</string>
+  <key>Label</key>              <string>@LABEL@</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__HOME__/Developer/sysobs/bin/sysobs</string>
+    <string>@SYSOBS@</string>
     <string>prune</string>
-    <string>--days</string><string>14</string>
+    <string>--days</string><string>@KEEPDAYS@</string>
     <string>--go</string>
   </array>
   <key>StartCalendarInterval</key>
@@ -20,7 +20,11 @@
   <key>ProcessType</key>        <string>Background</string>
   <key>LowPriorityIO</key>      <true/>
   <key>Nice</key>               <integer>10</integer>
-  <key>StandardOutPath</key>    <string>__HOME__/Library/Logs/sysobs-prune.log</string>
-  <key>StandardErrorPath</key>  <string>__HOME__/Library/Logs/sysobs-prune.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SYSOBS_HOME</key>      <string>@STORE@</string>
+  </dict>
+  <key>StandardOutPath</key>    <string>@LOGDIR@/sysobs-prune.log</string>
+  <key>StandardErrorPath</key>  <string>@LOGDIR@/sysobs-prune.log</string>
 </dict>
 </plist>

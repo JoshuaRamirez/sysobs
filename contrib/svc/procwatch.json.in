@@ -1,0 +1,12 @@
+{
+  "label": "@LABEL@",
+  "name": "sysobs-procwatch",
+  "purpose": "Continuous process-event recorder: polls the pid list at @POLL@s and spools every process START and EXIT (pid, ppid, uid, executable, argv, PARENT argv, lifetime) to @STORE@/spool. The snapshot job folds the spool into the process_event table. Answers 'what just ran and who launched it', which an interval snapshot cannot. Read with `sysobs events --since 1h --match <name>`. Blind spot: processes shorter than the poll interval may be missed; eslogger (root + Full Disk Access) would close that.",
+  "source": "@SOURCE@",
+  "docs": "@SOURCE@/README.md",
+  "health": {
+    "cmd": "test -n \"$(find @STORE@/spool -name 'procwatch-*.ndjson' -mmin -60)\""
+  },
+  "manage": {},
+  "registered_at": "@TODAY@"
+}

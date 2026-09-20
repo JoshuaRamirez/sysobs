@@ -1,0 +1,12 @@
+{
+  "label": "@LABEL@",
+  "name": "sysobs",
+  "purpose": "Every @INTERVAL@s: one normalized system snapshot (processes + cpu/ram per pid, sockets/ports/IPs, disk, interfaces, power delivery) into a star schema at @STORE@/tables. Runs --files none (~30 KB/snapshot, ~8 MB/day); run `sysobs snapshot --files own` by hand when you need the open-file table. Also folds procwatch's process-event spool into the store — it is the store's SINGLE WRITER. Read it back with `sysobs show` / `sysobs verify` / `sysobs db`.",
+  "source": "@SOURCE@",
+  "docs": "@SOURCE@/README.md",
+  "health": {
+    "cmd": "test $(( $(date +%s) - $(stat -f %m @STORE@/tables/snapshot.csv) )) -lt @STALE@"
+  },
+  "manage": {},
+  "registered_at": "@TODAY@"
+}
