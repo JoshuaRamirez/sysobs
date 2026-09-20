@@ -23,7 +23,9 @@ SVCDIR="${XDG_CONFIG_HOME:-$HOME/.config}/svc/services.d"
 
 INTERVAL=300      # seconds between snapshots
 POLL=0.1          # procwatch pid-list poll interval
-KEEPDAYS=14       # prune horizon
+KEEPDAYS=90       # prune horizon
+FULLDAYS=1        # keep EVERY snapshot this recent
+THINTO=1h         # beyond that, keep one snapshot per bucket
 MODE=symlink      # or `copy`
 WANT_AGENTS=1
 WANT_SVC=auto
@@ -41,6 +43,8 @@ usage: ./install.sh [options]
   --interval N        seconds between snapshots               (default $INTERVAL)
   --poll N            procwatch poll interval in seconds      (default $POLL)
   --keep-days N       prune horizon in days                   (default $KEEPDAYS)
+  --full-days N       keep every snapshot this recent         (default $FULLDAYS)
+  --thin-to DUR       thin older snapshots to one per bucket  (default $THINTO)
   --copy              copy the executable instead of symlinking it
   --no-agents         install the executable only, no launchd agents
   --no-svc            skip svc descriptors even if svc is installed
@@ -59,6 +63,8 @@ while [ $# -gt 0 ]; do
     --interval)     INTERVAL="$2"; shift 2 ;;
     --poll)         POLL="$2"; shift 2 ;;
     --keep-days)    KEEPDAYS="$2"; shift 2 ;;
+    --full-days)    FULLDAYS="$2"; shift 2 ;;
+    --thin-to)      THINTO="$2"; shift 2 ;;
     --copy)         MODE=copy; shift ;;
     --no-agents)    WANT_AGENTS=0; shift ;;
     --no-svc)       WANT_SVC=0; shift ;;
@@ -172,6 +178,8 @@ if [ "$WANT_AGENTS" = 1 ]; then
         -e "s|@INTERVAL@|$INTERVAL|g" \
         -e "s|@POLL@|$POLL|g" \
         -e "s|@KEEPDAYS@|$KEEPDAYS|g" \
+        -e "s|@FULLDAYS@|$FULLDAYS|g" \
+        -e "s|@THINTO@|$THINTO|g" \
         -e "s|@STALE@|$((INTERVAL * 6))|g" \
         -e "s|@TODAY@|$(date +%F)|g" \
         "$1"

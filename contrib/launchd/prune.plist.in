@@ -8,6 +8,8 @@
     <string>@SYSOBS@</string>
     <string>prune</string>
     <string>--days</string><string>@KEEPDAYS@</string>
+    <string>--full-days</string><string>@FULLDAYS@</string>
+    <string>--thin-to</string><string>@THINTO@</string>
     <string>--go</string>
   </array>
   <key>StartCalendarInterval</key>

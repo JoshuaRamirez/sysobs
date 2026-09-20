@@ -1894,19 +1894,67 @@ def _locked(fn):
         return fn()
 
 
+def _duration_seconds(spec: str) -> int:
+    """'30m', '2h', '1d', '45s' -> seconds. Raises ValueError on anything else,
+    because a silently-misread retention window deletes data."""
+    m = re.fullmatch(r"(\d+)([smhd])", str(spec).strip())
+    if not m:
+        raise ValueError(f"bad duration {spec!r} — use 45s, 30m, 2h or 1d")
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def plan_retention(stamps: list[tuple[str, float]], now: float, days: float,
+                   full_days: float = None, thin_seconds: int = 0
+                   ) -> tuple[list[str], list[str]]:
+    """Decide which snapshots survive. Pure, so it is fixture-testable and so a
+    retention policy can be reasoned about without a store.
+
+    Three tiers, newest to oldest:
+      * younger than `full_days`  -> keep every one (the rolling detail window)
+      * between that and `days`   -> keep ONE per `thin_seconds` bucket
+      * older than `days`         -> drop
+
+    With no --full-days/--thin-to this degrades exactly to the old behaviour:
+    one flat window, nothing thinned.
+    """
+    full_days = days if full_days is None else min(full_days, days)
+    hard_cut = now - days * 86400
+    full_cut = now - full_days * 86400
+    keep, drop, seen_buckets = [], [], set()
+    # oldest first, so the snapshot kept for a bucket is its earliest member —
+    # deterministic, and stable as more data arrives after it.
+    for sid, ts in sorted(stamps, key=lambda kv: kv[1]):
+        if ts < hard_cut:
+            drop.append(sid)
+        elif ts >= full_cut or not thin_seconds:
+            keep.append(sid)
+        else:
+            bucket = int(ts // thin_seconds)
+            if bucket in seen_buckets:
+                drop.append(sid)
+            else:
+                seen_buckets.add(bucket)
+                keep.append(sid)
+    return keep, drop
+
+
 def cmd_prune(store: Store, days: int, go: bool, as_json: bool,
-              event_days: int = None) -> int:
-    cutoff = time.time() - days * 86400
+              event_days: int = None, full_days: float = None,
+              thin_to: str = None) -> int:
+    now = time.time()
     event_days = days if event_days is None else event_days
-    keep, drop = [], []
+    thin_seconds = _duration_seconds(thin_to) if thin_to else 0
+    stamps = []
     for r in store.read("snapshot"):
         try:
             ts = datetime.strptime(r["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=timezone.utc).timestamp()
         except ValueError:
-            ts = time.time()
-        (drop if ts < cutoff else keep).append(r["snapshot_id"])
+            ts = now
+        stamps.append((r["snapshot_id"], ts))
+    keep, drop = plan_retention(stamps, now, days, full_days, thin_seconds)
     plan = {"root": str(store.root), "days": days, "event_days": event_days,
+            "full_days": full_days, "thin_to": thin_to,
             "keep": len(keep), "drop": drop, "applied": False}
     if go and drop:
         dropset = set(drop)
@@ -1929,7 +1977,9 @@ def cmd_prune(store: Store, days: int, go: bool, as_json: bool,
     if as_json:
         print(json.dumps(plan, indent=2))
     else:
-        print(f"{len(drop)} snapshot(s) older than {days}d, {len(keep)} kept"
+        tier = (f"keeping every snapshot for {full_days}d, then one per {thin_to} "
+                f"out to {days}d" if thin_seconds else f"older than {days}d")
+        print(f"{len(drop)} snapshot(s) dropped ({tier}), {len(keep)} kept"
               + (f", events older than {event_days}d dropped"
                  if plan.get("events_dropped") else "")
               + ("" if go else "  (dry run — add --go)"))
@@ -2476,9 +2526,42 @@ def selftest() -> int:
         check("harden reports what it changed", leaky in fixed, True)
         check("harden is idempotent", harden_store(root), [])
 
+    # ---- tiered retention: a rolling detail window over a long thin history.
+    # Pure function, so the policy can be checked without deleting anything.
+    check("duration 45s", _duration_seconds("45s"), 45)
+    check("duration 30m", _duration_seconds("30m"), 1800)
+    check("duration 2h", _duration_seconds("2h"), 7200)
+    check("duration 1d", _duration_seconds("1d"), 86400)
+    try:
+        _duration_seconds("1 hour")
+        check("bad duration raises", False, True)
+    except ValueError:
+        check("bad duration raises", True, True)
+
+    now = 1_000_000.0
+    # one snapshot a minute for 72 hours
+    minutes = [(f"s{i}", now - i * 60) for i in range(72 * 60)]
+    keep, drop = plan_retention(minutes, now, days=3, full_days=1, thin_seconds=3600)
+    # 1441, not 1440: the window boundary is inclusive, so the snapshot sitting
+    # exactly 24h back is still detail. 49, not 48: a 48-hour span touches 49
+    # hourly bucket boundaries when it does not start on one.
+    check("thin keeps every snapshot inside the full window", len(
+        [k for k in keep if dict(minutes)[k] >= now - 86400]), 1441)
+    check("thin keeps one per hour beyond it", len(
+        [k for k in keep if dict(minutes)[k] < now - 86400]), 49)
+    check("thin drops the rest", len(keep) + len(drop), len(minutes))
+    check("nothing beyond --days survives",
+          all(dict(minutes)[k] >= now - 3 * 86400 for k in keep), True)
+
+    flat_keep, flat_drop = plan_retention(minutes, now, days=3)
+    check("no thinning flag degrades to the old flat window",
+          (len(flat_keep), len(flat_drop)), (len(minutes), 0))
+    check("full_days cannot exceed days",
+          len(plan_retention(minutes, now, days=1, full_days=9)[0]), 1441)
+
     for line in fails:
         print(f"FAIL {line}")
-    total = 75
+    total = 85
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
@@ -2790,9 +2873,17 @@ def main(argv=None) -> int:
     sp.add_argument("--event-days", type=int, default=None,
                     help="separate retention for process_event, which arrives "
                          "hundreds of times a minute (default: same as --days)")
+    sp.add_argument("--full-days", type=float, default=None,
+                    help="keep EVERY snapshot this recent, then thin the rest "
+                         "out to --days (default: keep everything, thin nothing)")
+    sp.add_argument("--thin-to", default=None, metavar="DURATION",
+                    help="beyond --full-days keep one snapshot per bucket: "
+                         "15m, 1h, 1d. Turns a flat window into a rolling "
+                         "detail window over a long, cheap history")
     sp.add_argument("--go", action="store_true", help="apply (default is a dry run)")
     sp.set_defaults(fn=lambda a: _locked(
-        lambda: cmd_prune(Store(), a.days, a.go, a.json, a.event_days)))
+        lambda: cmd_prune(Store(), a.days, a.go, a.json, a.event_days,
+                          a.full_days, a.thin_to)))
 
     sp = sub.add_parser("selftest", help="behaviour fixtures")
     sp.set_defaults(fn=lambda a: selftest())

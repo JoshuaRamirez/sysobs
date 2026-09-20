@@ -352,6 +352,58 @@ installer also writes descriptors from `contrib/svc/*.json.in`, so
 local convenience, not a dependency — it is skipped silently when `svc` is
 absent.
 
+## What it costs, and rolling retention
+
+Measured on an M-series Mac, 5-minute cadence with `procwatch` running:
+
+| | |
+|---|---|
+| one snapshot, `--files none` | **~4.0 s median, 6.4 s p95** — about **1.3% of one core** |
+| `procwatch`, continuously | **~0.9% of one core, 18 MB RSS** |
+| store growth | **~135 MB/day** of CSV |
+| the SQLite mirror | derived, rebuildable, not part of the cost |
+
+CPU is not the constraint. **Disk is**, and it scales with cadence:
+
+| cadence | CSV per day |
+|---|---|
+| 1 hour | ~11 MB |
+| 5 min *(default)* | ~135 MB |
+| 1 min | ~675 MB |
+
+Which is why retention is tiered rather than flat. Keep full detail for a
+rolling window, then thin the history to something you can afford to keep
+for a year:
+
+```sh
+# every snapshot for the last 24h, then one per hour out to 90 days
+sysobs prune --days 90 --full-days 1 --thin-to 1h --go
+```
+
+Dry run first — without `--go` it only tells you what it would do:
+
+```
+214 snapshot(s) dropped (keeping every snapshot for 1.0d,
+                         then one per 1h out to 90d), 302 kept
+```
+
+Thinning drops whole snapshots and then garbage-collects any dimension row
+nothing references any more, so the store shrinks **without** the history
+developing holes: `sysobs verify` is clean on the other side. `--event-days`
+retains process events separately, since they arrive hundreds of times a
+minute.
+
+The installed prune agent runs this weekly, and the defaults are
+`--keep-days 90 --full-days 1 --thin-to 1h`. Change them at install time:
+
+```sh
+./install.sh --interval 60 --full-days 2 --thin-to 15m --keep-days 365
+```
+
+That combination — a snapshot every minute, full detail for 48 hours, then
+one every 15 minutes for a year — costs roughly 1.3 GB rather than the
+240 GB the same cadence would need unthinned.
+
 ## Known asymmetry
 
 `process.argv` is still stored inline, one copy per process per snapshot, which

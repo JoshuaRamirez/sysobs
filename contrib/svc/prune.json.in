@@ -1,7 +1,7 @@
 {
   "label": "@LABEL@",
   "name": "sysobs-prune",
-  "purpose": "Sundays 04:15: drop snapshots older than @KEEPDAYS@ days from @STORE@, then drop any dimension row no surviving fact still references — so the store stays bounded WITHOUT breaking referential integrity. Dry-run by hand with `sysobs prune --days N` (no --go). Verify after with `sysobs verify`.",
+  "purpose": "Sundays 04:15: keep every snapshot for @FULLDAYS@d, thin older ones to one per @THINTO@, drop anything past @KEEPDAYS@d from @STORE@, then drop any dimension row no surviving fact still references — so the store stays bounded WITHOUT breaking referential integrity. Dry-run by hand with `sysobs prune --days N` (no --go). Verify after with `sysobs verify`.",
   "source": "@SOURCE@",
   "docs": "@SOURCE@/README.md",
   "health": {
