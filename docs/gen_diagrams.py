@@ -9,7 +9,7 @@ re-drawing every edge that touches it.
 from __future__ import annotations
 import html, math, pathlib
 
-OUT = pathlib.Path(__file__).resolve().parent.parent / "claude-genui-output" / "sysobs-diagrams.html"
+OUT = pathlib.Path(__file__).resolve().parent / "sysobs-diagrams.html"
 
 # ---------------------------------------------------------------- palette
 BG, PANEL, LINE, INK, MUTE = "#0d1117", "#161b22", "#30363d", "#e6edf3", "#8b949e"

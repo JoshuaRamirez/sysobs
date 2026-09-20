@@ -289,14 +289,38 @@ not a dependency.
 ## Known asymmetry
 
 `process.argv` is still stored inline, one copy per process per snapshot, which
-is why `process.csv` is the largest table in the store (62 MB against
-`process_event.csv`'s 19 MB for many more rows). The `argv` dimension that
+is why `process.csv` is the largest table in the store (81 MB against
+`process_event.csv`'s 22 MB for five times as many rows). The `argv` dimension that
 `process_event` uses was added later and `process` has not been migrated onto
 it. Doing so is a schema change plus a rewrite of the existing CSV, worth doing
 deliberately rather than opportunistically — the last in-place migration here
 was performed while the 5-minute agent was running the same script and wrote a
 few hundred column-shifted rows. Stop the agent first, or write through the
 tool under `.store.lock`.
+
+## Diagrams
+
+`docs/sysobs-diagrams.html` is a single self-contained page — no network, no
+CDN — holding six logical views of the system:
+
+| | |
+|---|---|
+| communication pathways | every channel, typed by colour **and** glyph so it survives greyscale; probe pathways are double-headed because this tool instruments nothing and every reading is a question asked of a stock binary |
+| swimlanes | five flow orders over one set of nine lanes — the lanes never change, only the order they are visited |
+| class model | every element that appears in any other diagram, once |
+| use cases | `«include»` (always) kept distinct from `«extend»` (only when asked) |
+| activity | the five behaviours where a naive implementation loses data |
+| component containment | structure with the connections deliberately removed |
+
+```sh
+python3 docs/gen_diagrams.py      # regenerate
+open docs/sysobs-diagrams.html
+```
+
+Generated rather than drawn, and the element names are read from the same
+`SCHEMA` dict the CSV headers and the SQL DDL come from — for the same reason.
+A diagram maintained by hand drifts from the thing it describes, and a drifted
+diagram is worse than none.
 
 ## Selftest
 
