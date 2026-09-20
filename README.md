@@ -1,5 +1,11 @@
 # sysobs
 
+[![ci](https://github.com/JoshuaRamirez/sysobs/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshuaRamirez/sysobs/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![macOS](https://img.shields.io/badge/macOS-12%2B-lightgrey)
+![python](https://img.shields.io/badge/python-3.9%2B-blue)
+![dependencies: none](https://img.shields.io/badge/dependencies-none-success)
+
 A normalized, referentially-intact log of what this machine is doing.
 
 One `sysobs snapshot` records, for a single instant: every running process with
@@ -26,6 +32,26 @@ sysobs events --since 1h        # what started and stopped since
 sysobs verify                   # every reference resolves?
 sysobs db && sysobs query "..." # SQL, with the FKs enforced by SQLite
 ```
+
+## What it collects, and where it goes
+
+**Nowhere.** sysobs makes no network connection of its own. The store is local,
+owner-readable only (`0700`/`0600`), and nothing is uploaded, phoned home or
+shared.
+
+The one opt-in exception is `--geo online`, which resolves **public** IP
+addresses through `ip-api.com`. Private, loopback and link-local addresses are
+never sent, the installed agents never pass the flag, and `--rdns` uses only
+your system resolver.
+
+Be equally clear about the other direction: **this is a surveillance tool
+pointed at your own machine.** It records the full command line of every
+process it can see, and command lines are where secrets leak — `mysql
+-pPASSWORD`, an API key passed as a flag, a token in a `curl`. There is no
+redaction. Treat `$SYSOBS_HOME` the way you would treat a credentials file,
+and never paste raw store contents into a bug report.
+
+See [SECURITY.md](SECURITY.md) for the full statement.
 
 ## Install
 
@@ -351,7 +377,7 @@ diagram is worse than none.
 
 ## Selftest
 
-`sysobs selftest` runs 71 fixtures in a temporary store, no privileges and no
+`sysobs selftest` runs 75 fixtures in a temporary store, no privileges and no
 network. They cover the places this tool breaks quietly rather than the places
 it is obviously right:
 
@@ -371,3 +397,16 @@ it is obviously right:
   load incrementally
 
 Run it after every change; it is the contract, not a smoke test.
+
+## Contributing
+
+Bug reports and patches welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The
+short version: `sysobs selftest` is the contract, a parsing fix needs a fixture
+built from the real string you saw, and the schema is a single source of truth
+rather than three places to remember.
+
+Security issues go through [private reporting](SECURITY.md), not public issues.
+
+## License
+
+[MIT](LICENSE) © 2026 Joshua Ramirez

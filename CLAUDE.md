@@ -24,7 +24,7 @@ a header, a `CREATE TABLE`, or a check that names columns directly — add it to
 the schema declaration and let all three follow. A composite parent a single
 column cannot express goes in `FACT_PARENT`.
 
-**`sysobs selftest` is the contract, not a smoke test.** 71 fixtures, no
+**`sysobs selftest` is the contract, not a smoke test.** 75 fixtures, no
 privileges, no network. Run it after every change. It pins the output formats
 the tool does not own (`ps`, `top`, `lsof`, `netstat`, `ioreg`) and causes the
 store's failure modes deliberately — dangling FK, orphaned fact, column-shifted
