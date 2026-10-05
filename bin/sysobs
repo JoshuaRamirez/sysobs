@@ -538,6 +538,41 @@ class Store:
                     break
         return out
 
+    def iter(self, table: str):
+        """Rows one at a time, never the whole table in memory."""
+        p = self.tables / f"{table}.csv"
+        if not p.exists():
+            return
+        with p.open(newline="", encoding="utf-8") as fh:
+            yield from csv.DictReader(fh)
+
+    def column(self, table: str, col: str) -> set[str]:
+        """The distinct values of one column, streamed."""
+        return {r.get(col, "") for r in self.iter(table)}
+
+    def keep_where(self, table: str, keep) -> tuple[int, int]:
+        """Rewrite a table with only the rows keep(row) accepts, streamed row by
+        row to a temp file and swapped in. Returns (rows before, rows after)."""
+        t = SCHEMA[table]
+        src = self.tables / f"{table}.csv"
+        if not src.exists():
+            return 0, 0
+        tmp = src.with_suffix(".csv.tmp")
+        before = after = 0
+        with tmp.open("w", newline="", encoding="utf-8") as out:
+            w = csv.DictWriter(out, fieldnames=t.columns, extrasaction="ignore")
+            w.writeheader()
+            for r in self.iter(table):
+                before += 1
+                if keep(r):
+                    after += 1
+                    w.writerow({c: r.get(c, "") for c in t.columns})
+        if after == before:
+            tmp.unlink()
+        else:
+            tmp.replace(src)
+        return before, after
+
     def load_dim(self, table: str) -> dict[str, dict]:
         if table not in self.dims:
             key = SCHEMA[table].pk[0]
@@ -2060,20 +2095,18 @@ def cmd_prune(store: Store, days: int, go: bool, as_json: bool,
             "full_days": full_days, "thin_to": thin_to,
             "keep": len(keep), "drop": drop, "applied": False}
     if go and drop:
+        # every table is filtered as a stream: read() held whole tables (13.3M
+        # events, 20.9 GB), the memory pressure behind the 2026-10-05 panic
         dropset = set(drop)
         for name, t in SCHEMA.items():
             if t.kind != "fact" or "snapshot_id" not in t.columns:
                 continue
-            rows = [r for r in store.read(name) if r["snapshot_id"] not in dropset]
-            store.replace(name, rows)
+            store.keep_where(name, lambda r: r["snapshot_id"] not in dropset)
         # dimensions are deliberately kept: they are the shared vocabulary the
         # surviving snapshots still reference. Only ones nothing points at go.
         cut_iso = _iso_ms(time.time() - event_days * 86400)
-        events = store.read("process_event")
-        kept_events = [r for r in events if r.get("ts", "") >= cut_iso]
-        if len(kept_events) != len(events):
-            store.replace("process_event", kept_events)
-        plan["events_dropped"] = len(events) - len(kept_events)
+        before, after = store.keep_where("process_event", lambda r: r.get("ts", "") >= cut_iso)
+        plan["events_dropped"] = before - after
         removed = _gc_dimensions(store)
         plan["applied"] = True
         plan["dimensions_removed"] = removed
@@ -2105,12 +2138,11 @@ def _gc_dimensions(store: Store) -> dict[str, int]:
                 "interface", "host"):
         used = set()
         for tname, col in referrers.get(dim, []):
-            used |= {r.get(col, "") for r in store.read(tname)}
-        rows = store.read(dim)
-        kept = [r for r in rows if r[SCHEMA[dim].pk[0]] in used]
-        if len(kept) != len(rows):
-            store.replace(dim, kept)
-            removed[dim] = len(rows) - len(kept)
+            used |= store.column(tname, col)              # ids only, streamed
+        key = SCHEMA[dim].pk[0]
+        before, after = store.keep_where(dim, lambda r: r[key] in used)
+        if after != before:
+            removed[dim] = before - after
     return removed
 
 
@@ -2656,6 +2688,41 @@ def selftest() -> int:
             check("tail ids: a window before the start is everything",
                   len(tst.tail_ids("process_event", "event_id", "ts", "2000", block=64)), 200)
 
+            # prune streams too: an old snapshot, old events and an argv nothing
+            # references go, with whole-table reads of the big tables forbidden
+            pst = Store(Path(tmp) / "prune")
+            def put(name, rows):
+                with (pst.tables / f"{name}.csv").open("w", newline="", encoding="utf-8") as fh:
+                    w = csv.DictWriter(fh, fieldnames=SCHEMA[name].columns, extrasaction="ignore")
+                    w.writeheader()
+                    for r in rows:
+                        w.writerow({c: r.get(c, "") for c in SCHEMA[name].columns})
+            fresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            put("snapshot", [{"snapshot_id": "s_old", "started_at": "2020-01-01T00:00:00Z"},
+                             {"snapshot_id": "s_new", "started_at": fresh}])
+            put("process_event", [{"event_id": "e_old", "ts": "2020-01-01T00:00:00.000Z", "argv_id": "g_old"},
+                                  {"event_id": "e_new", "ts": _iso_ms(time.time()), "argv_id": "g_new"}])
+            put("argv", [{"argv_id": "g_old", "text": "old"}, {"argv_id": "g_new", "text": "new"}])
+            def _no_big_read(self, table):
+                if table in ("process_event", "argv", "process", "process_sample", "socket"):
+                    raise AssertionError(f"prune read all of {table}")
+                return _read(self, table)
+            Store.read = _no_big_read
+            try:
+                import contextlib as _cl, io as _io
+                with _cl.redirect_stdout(_io.StringIO()):
+                    cmd_prune(pst, 14, True, False)
+                check("prune kept only the fresh event",
+                      [r["event_id"] for r in pst.iter("process_event")], ["e_new"])
+                check("prune dropped the argv nothing references",
+                      [r["argv_id"] for r in pst.iter("argv")], ["g_new"])
+                check("prune dropped the old snapshot",
+                      [r["snapshot_id"] for r in pst.iter("snapshot")], ["s_new"])
+            except AssertionError as e:
+                fails.append(str(e))
+            finally:
+                Store.read = _read
+
             ev = Store(Path(tmp)).read("process_event")[0]
             check("event references a command dimension",
                   ev["command_id"] in {r["command_id"] for r in Store(Path(tmp)).read("command")},
@@ -2779,7 +2846,7 @@ def selftest() -> int:
 
     for line in fails:
         print(f"FAIL {line}")
-    total = ran[0] + sum(1 for f in fails if f.startswith("ingest read all"))   # counted, not typed
+    total = ran[0] + sum(1 for f in fails if f.startswith(("ingest read all", "prune read all")))   # counted, not typed
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
