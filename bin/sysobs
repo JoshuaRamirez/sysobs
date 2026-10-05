@@ -47,7 +47,7 @@ import struct
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 VERSION = "0.2.0"
@@ -503,6 +503,40 @@ class Store:
             return []
         with p.open(newline="", encoding="utf-8") as fh:
             return list(csv.DictReader(fh))
+
+    def tail_ids(self, table: str, id_col: str, ts_col: str, since: str,
+                 block: int = 1 << 22) -> set[str]:
+        """The ids of rows whose ts is at or after `since`, read from the END of
+        an append-only fact table, a block at a time, stopping at the first
+        block that is wholly older. Memory is bounded by the window asked for,
+        not by the table: read() of process_event held 13.3M rows, 20.9 GB, on
+        every snapshot (the 2026-10-05 10:54 panic under memory pressure)."""
+        p = self.tables / f"{table}.csv"
+        if not p.exists():
+            return set()
+        cols = SCHEMA[table].columns
+        ii, ti = cols.index(id_col), cols.index(ts_col)
+        out: set[str] = set()
+        with p.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos, carry = fh.tell(), b""
+            while pos > 0:
+                n = min(block, pos)
+                pos -= n
+                fh.seek(pos)
+                buf = fh.read(n) + carry
+                lines = buf.split(b"\n")
+                carry = lines.pop(0) if pos > 0 else b""   # may be a partial line
+                newest = ""
+                for row in csv.reader(l.decode("utf-8", "replace") for l in lines if l):
+                    if len(row) <= max(ii, ti) or row[ii] == id_col:
+                        continue
+                    newest = max(newest, row[ti])
+                    if row[ti] >= since:
+                        out.add(row[ii])
+                if newest and newest < since:
+                    break
+        return out
 
     def load_dim(self, table: str) -> dict[str, dict]:
         if table not in self.dims:
@@ -2239,7 +2273,32 @@ def ingest_spool(store: Store, refs: Refs = None, keep_hours: int = 6) -> dict:
         offsets = json.loads(OFFSETS.read_text()) if OFFSETS.exists() else {}
     except json.JSONDecodeError:
         offsets = {}
-    seen = {r["event_id"] for r in store.read("process_event")}
+    # Dedupe only against the stretch of history a replay could repeat: rows at
+    # or after the oldest event still to be read, less a keep_hours margin.
+    # Reading the whole table here grew with it, 20.9 GB at 13.3M rows.
+    pending_ts = []
+    for path in sorted(SPOOL.glob("procwatch-*.ndjson")):
+        start = int(offsets.get(path.name, 0))
+        if start > path.stat().st_size:
+            start = 0
+        with path.open("r", encoding="utf-8") as fh:
+            fh.seek(start)
+            for line in fh:
+                if not line.endswith("\n"):
+                    break
+                try:
+                    ts = json.loads(line).get("ts", "")
+                except json.JSONDecodeError:
+                    continue
+                if ts:
+                    pending_ts.append(ts)
+                    break                       # a file's first pending line is its oldest
+    if pending_ts:
+        oldest = datetime.fromisoformat(min(pending_ts).replace("Z", "+00:00"))
+        since = (oldest - timedelta(hours=keep_hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    else:
+        since = "9999"                          # nothing to read, nothing to dedupe against
+    seen = store.tail_ids("process_event", "event_id", "ts", since) if pending_ts else set()
     total, files = 0, 0
     for path in sorted(SPOOL.glob("procwatch-*.ndjson")):
         start = int(offsets.get(path.name, 0))
@@ -2336,7 +2395,10 @@ def selftest() -> int:
     global TABLES, SPOOL, OFFSETS, LOCK
     fails: list[str] = []
 
+    ran = [0]
+
     def check(label, got, want):
+        ran[0] += 1
         if got != want:
             fails.append(f"{label}: got {got!r}, want {want!r}")
 
@@ -2560,6 +2622,40 @@ def selftest() -> int:
             check("replay without an offset still dedupes on event_id",
                   dup["events"], 0)
 
+            # bounded memory (2026-10-05): ingest must not load the whole event
+            # history to dedupe; it reads ids from the table's tail only
+            _read = Store.read
+            def _no_full_read(self, table):
+                if table == "process_event":
+                    raise AssertionError("ingest read all of process_event")
+                return _read(self, table)
+            Store.read = _no_full_read
+            try:
+                if OFFSETS.exists():
+                    OFFSETS.unlink()
+                bounded = ingest_spool(Store(Path(tmp)), Refs(st, now_iso()))
+                check("dedupe without reading the whole event table", bounded["events"], 0)
+            except AssertionError as e:
+                fails.append(str(e))
+            finally:
+                Store.read = _read
+            tst = Store(Path(tmp) / "tail")
+            rows = [{"event_id": f"e{i}", "ts": f"2026-10-0{1 + i // 50}T00:00:{i % 50:02d}.000Z"}
+                    for i in range(200)]
+            # written by hand: replace() goes to the global TABLES, not this store
+            with (tst.tables / "process_event.csv").open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=SCHEMA["process_event"].columns, extrasaction="ignore")
+                w.writeheader()
+                for r in rows:
+                    w.writerow({c: r.get(c, "") for c in SCHEMA["process_event"].columns})
+            got = tst.tail_ids("process_event", "event_id", "ts", "2026-10-03T00:00:00.000Z", block=64)
+            check("tail ids across tiny blocks: exactly the window",
+                  got, {f"e{i}" for i in range(100, 200)})
+            check("tail ids: a window past the end is empty",
+                  tst.tail_ids("process_event", "event_id", "ts", "2027", block=64), set())
+            check("tail ids: a window before the start is everything",
+                  len(tst.tail_ids("process_event", "event_id", "ts", "2000", block=64)), 200)
+
             ev = Store(Path(tmp)).read("process_event")[0]
             check("event references a command dimension",
                   ev["command_id"] in {r["command_id"] for r in Store(Path(tmp)).read("command")},
@@ -2683,7 +2779,7 @@ def selftest() -> int:
 
     for line in fails:
         print(f"FAIL {line}")
-    total = 95
+    total = ran[0] + sum(1 for f in fails if f.startswith("ingest read all"))   # counted, not typed
     print(f"{total - len(fails)}/{total} checks passed" if not fails
           else f"{len(fails)} failure(s)")
     return 1 if fails else 0
