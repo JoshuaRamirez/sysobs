@@ -22,7 +22,7 @@ AGENTS="$HOME/Library/LaunchAgents"
 SVCDIR="${XDG_CONFIG_HOME:-$HOME/.config}/svc/services.d"
 
 INTERVAL=300      # seconds between snapshots
-POLL=0.1          # procwatch pid-list poll interval
+POLL=1            # procwatch pid-list poll interval
 KEEPDAYS=90       # prune horizon
 FULLDAYS=1        # keep EVERY snapshot this recent
 THINTO=1h         # beyond that, keep one snapshot per bucket
