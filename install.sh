@@ -245,6 +245,22 @@ if [ "$WANT_AGENTS" = 1 ]; then
     run "$SUB" enable --name "$N_PROC" --role watcher --dir "$HOME" \
         --env "SYSOBS_HOME=$STORE" \
         -- "$PY" "$TARGET" procwatch --interval "$POLL" --quiet
+    # launchd starts a job with no ProcessType at base priority 20, under
+    # everything at 31; nothing an unprivileged process does at run time lifts
+    # that (thread QoS, taskpolicy tiers and the Darwin role were each
+    # measured). ProcessType Interactive starts it at 31, as procwatch had
+    # before. sub enable has no option for it yet, so it is added to the two
+    # plists sub wrote, and they are reloaded.
+    for n in "$N_SNAP" "$N_PROC"; do
+      pl="$AGENTS/dev.substrate.$n.plist"
+      if [ "$DRYRUN" = 1 ]; then say "would: set ProcessType Interactive in $pl and reload it"; continue; fi
+      /usr/libexec/PlistBuddy -c "Delete :ProcessType" "$pl" >/dev/null 2>&1 || true
+      /usr/libexec/PlistBuddy -c "Add :ProcessType string Interactive" "$pl"
+      plutil -lint "$pl" >/dev/null
+      launchctl bootout "gui/$UID/dev.substrate.$n" 2>/dev/null || true
+      launchctl bootstrap "gui/$UID" "$pl"
+      say "dev.substrate.$n — ProcessType Interactive"
+    done
   else
     install_agent "$SRC/contrib/launchd/snapshot.plist.in"  "$L_SNAP"
     install_agent "$SRC/contrib/launchd/procwatch.plist.in" "$L_PROC"
