@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -158,6 +159,28 @@ class TestPriorityUnderLoad(unittest.TestCase):
                 self.assertFalse(so.raise_priority(cores=16)["active"])
                 self.assertEqual(calls, {"setpriority": [], "qos": 0, "tier": 0})
                 self.assertEqual(so.boosted_argv(["ps"]), ["ps"])
+
+    def test_full_snapshot_yields_when_calm_and_rises_when_pegged(self):
+        """The heavy work is background while the machine is calm, and comes
+        out of background the moment the load crosses the threshold."""
+        with tempfile.TemporaryDirectory() as tmp:
+            so = load_sysobs(Path(tmp))
+            calls, stubs = self._stubs(so)
+            loads = iter([3.0, 3.0] + [400.0] * 1000)
+            with contextlib.ExitStack() as st:
+                for s in stubs:
+                    st.enter_context(s)
+                st.enter_context(mock.patch.dict(os.environ, {"SYSOBS_BOOST": "1"}))
+                st.enter_context(mock.patch.object(so, "load1", side_effect=lambda: next(loads),
+                                                   create=True))
+                so.settle_priority(every=0.02)
+                self.assertEqual(calls["setpriority"][0], (so.PRIO_DARWIN_PROCESS, 0, so.PRIO_DARWIN_BG))
+                for _ in range(200):
+                    if so.BOOST["active"]:
+                        break
+                    time.sleep(0.02)
+            self.assertTrue(so.BOOST["active"], "the snapshot stayed in background under load")
+            self.assertEqual(calls["setpriority"][-1], (so.PRIO_DARWIN_PROCESS, 0, 0))
 
     def test_procwatch_raises_itself_when_load_rises(self):
         with tempfile.TemporaryDirectory() as tmp:

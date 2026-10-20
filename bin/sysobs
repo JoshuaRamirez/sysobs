@@ -2327,6 +2327,32 @@ def raise_priority(load: float | None = None, cores: int | None = None) -> dict:
     return BOOST
 
 
+PRIO_DARWIN_BG = 1                      # setpriority(PRIO_DARWIN_PROCESS, 0, 1): background
+
+
+def settle_priority(every: float = 10.0) -> None:
+    """For the heavy work, the full snapshot: background while the machine is
+    calm (it is a big rewrite and his foreground comes first), raised the
+    moment the machine is pegged (it has to keep going). A daemon thread reads
+    the load every `every` seconds for as long as the snapshot runs, because
+    the load can rise after it starts: the 20:29Z snapshot of 10-20 started at
+    background and took forty minutes once the peak came."""
+    if not boost_enabled():
+        return
+    if raise_priority()["active"]:
+        return
+    try:
+        _setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)
+    except OSError:
+        return
+
+    def watch():
+        while not raise_priority()["active"]:
+            time.sleep(every)
+    import threading
+    threading.Thread(target=watch, name="sysobs-priority", daemon=True).start()
+
+
 def boost_text() -> str:
     if not BOOST["active"]:
         return ""
@@ -2662,7 +2688,7 @@ def selftest() -> int:
     """Behaviour fixtures for the parts that parse someone else's output format —
     the places this tool breaks quietly when macOS changes its mind."""
     import tempfile
-    global TABLES, SPOOL, OFFSETS, LOCK
+    global TABLES, SPOOL, OFFSETS, LOCK, LIGHT
     fails: list[str] = []
 
     ran = [0]
@@ -2860,6 +2886,11 @@ def selftest() -> int:
                 check("exit names the SAME parent the start did",
                       exited[0]["parent_exe"], started[0]["parent_exe"])
 
+            if not (started and exited):
+                # A pegged machine can starve this loop past the child's whole
+                # life. Say so as a failure instead of an IndexError below.
+                raise LookupError("procwatch fixture missed the 0.35 s process (machine "
+                                  "too busy?); the event checks that depend on it did not run")
             spool_write(started + exited)
             ing = ingest_spool(st, Refs(st, now_iso()))
             st.flush()
@@ -2978,6 +3009,8 @@ def selftest() -> int:
                   any(f["check"] == "type_mismatch" for f in rep["findings"]), True)
             st6.replace("process_event", Store(Path(tmp)).read("process_event")[1:])
             check("sqlite accepts events", build_db(Store(Path(tmp)))["ok"], True)
+        except LookupError as e:
+            fails.append(str(e))
         finally:
             SPOOL, OFFSETS, LOCK, TABLES = saved
 
@@ -3033,11 +3066,12 @@ def selftest() -> int:
     # shape of a real failure: the mirror rejected 300k sound process_event
     # rows because executemany is a single statement and one row dangled.
     with tempfile.TemporaryDirectory() as tmp:
-        saved = (SPOOL, OFFSETS, LOCK, TABLES)
+        saved = (SPOOL, OFFSETS, LOCK, TABLES, LIGHT)
         try:
             SPOOL, OFFSETS, LOCK = (Path(tmp) / "spool", Path(tmp) / "spool" / "offsets.json",
                                     Path(tmp) / ".lock")
             TABLES = Path(tmp) / "tables"
+            LIGHT = Path(tmp) / "light"          # the light sample stays in the fixture too
             st = Store(Path(tmp))
             import contextlib, io
             with contextlib.redirect_stdout(io.StringIO()):
@@ -3053,8 +3087,10 @@ def selftest() -> int:
                   rep["loaded"].get("process_event", 0), good)
             check("and the rejection is reported",
                   "rejected" in rep and "process_event" in rep["rejected"], True)
+            check("the fixture's light sample lands in the fixture, not the real store",
+                  len(list(LIGHT.glob("light-*.ndjson.gz"))), 1)
         finally:
-            SPOOL, OFFSETS, LOCK, TABLES = saved
+            SPOOL, OFFSETS, LOCK, TABLES, LIGHT = saved
 
     # ---- the incremental sync must stay cheap, and it is the UPSERT that
     # keeps it cheap: no parent DELETE means no child scan, with or without
@@ -3097,6 +3133,7 @@ def cmd_snapshot(args) -> int:
     does not wait for it: the light sample already holds this tick."""
     raise_priority()
     light = None if getattr(args, "no_light", False) else light_sample(note=args.note or "")
+    settle_priority()
     store = Store()
     try:
         lock = StoreLock(timeout=0).__enter__()
@@ -3247,8 +3284,17 @@ def cmd_light(args) -> int:
               f"{r['processes']} processes  cpu {r['cpu_pct_total']}% total  {r['status']}")
         for p in r["top"]:
             rss = human((p["rss_kb"] or 0) * 1024) if isinstance(p["rss_kb"], int) else "?"
-            print(f"  {p['pid']:>7} {p['cpu_pct']:>6}% {rss:>8}  {p['command'][:110]}")
+            print(f"  {p['pid']:>7} {p['cpu_pct']:>6}% {rss:>8}  {_short_command(p['command'])[:110]}")
     return 0
+
+
+def _short_command(cmd: str) -> str:
+    """The executable's path cut to its name, so the arguments that tell two
+    pythons apart fit on the line: /opt/.../Python x.py -> Python x.py."""
+    head, sep, rest = cmd.partition(" /")             # an argument path starts the rest
+    if head.startswith("/") and "/" in head:
+        head = head.rsplit("/", 1)[1]
+    return head + (sep + rest if sep else "")
 
 
 def _parse_when(text: str) -> datetime | None:

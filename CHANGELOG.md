@@ -7,7 +7,7 @@ this project uses [Semantic Versioning](https://semver.org).
 
 It keeps sampling under heavy load (the Desk #m1020-1547-c8d1). Baseline
 `ca90e92`; release notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
-Tests: 106/106 selftest checks, 6/6 heavy-load tests.
+Tests: 7/7 heavy-load tests; selftest 107 checks, all passing at load 77, with the procwatch fixture (a 0.35 s child at 50 ms polling) missing its child when run at background QoS over load ~150.
 
 ### Added
 
@@ -18,6 +18,12 @@ Tests: 106/106 selftest checks, 6/6 heavy-load tests.
   its snapshots and procwatch clear the background clamp, go to
   user-interactive thread QoS and tier 0, and run their children under
   `taskpolicy -t 0 -l 0`. `SYSOBS_BOOST=0` off, `SYSOBS_BOOST_FACTOR` the threshold.
+  The full snapshot runs in background while the machine is calm and comes
+  out of it when the load crosses the threshold, checked every 10 s.
+- The sampler and procwatch start at `ProcessType Interactive` (base priority
+  31). A launchd job without it starts at 20, and nothing an unprivileged
+  process does at run time lifts that (measured: thread QoS, taskpolicy tiers,
+  the Darwin role).
 - `tests/test_sample_under_load.py`: lock held, cut-off snapshot, stubbed
   load, procwatch under substrate.
 
@@ -40,6 +46,9 @@ Tests: 106/106 selftest checks, 6/6 heavy-load tests.
 - **A snapshot waited 120 s on the store lock and then died** with
   `TimeoutError`. It now skips its write at once (`LockBusy`), as does the
   ingest in `events`.
+- selftest's procwatch fixture crashed with `IndexError` when a pegged
+  machine starved it past the 0.35 s child's life; it reports a failure now.
+  The `cmd_snapshot` fixture's light sample stays in its temp store.
 
 ## [0.2.0] — 2026-09-20
 
