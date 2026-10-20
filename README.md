@@ -63,9 +63,12 @@ cd sysobs
 ./install.sh
 ```
 
-That puts `sysobs` on your PATH and loads three launchd agents — snapshot,
-procwatch, prune. The installer runs `selftest` first and refuses to install
-if it fails, rather than scheduling a job that breaks every five minutes.
+That puts `sysobs` on your PATH and starts three jobs: the sampler
+(`sysobs watch`) and procwatch under substrate (`sub enable`) when `sub` is on
+the machine, otherwise as launchd agents, and the weekly prune as a launchd
+agent. Every job names an absolute interpreter (Homebrew's `python3` when
+present; `--python` to choose): launchd's own PATH finds the Xcode 3.9 stub.
+`./install.sh --selftest` runs the fixtures first and stops if they fail.
 `./install.sh --dry-run` prints what it would do and changes nothing.
 
 ```sh
@@ -240,8 +243,9 @@ sysobs events --since 2h --json        # --no-ingest to read only what is stored
 
 Install it as an always-on agent:
 
-`./install.sh` already did this. It runs as `local.sysobs-procwatch`, with
-`KeepAlive`, so it comes back after a crash or a reboot.
+`./install.sh` already did this. It runs as substrate's `sysobs-proc`
+(`dev.substrate.sysobs-proc`; `local.sysobs-procwatch` without substrate),
+restarted if it exits, so it comes back after a crash or a reboot.
 
 Four properties worth knowing:
 
@@ -329,8 +333,28 @@ Two kinds, both normalized:
 sysobs watch --interval 300            # foreground
 ```
 
-Or leave it to launchd — `./install.sh` installs it as `local.sysobs`,
-rendered from `contrib/launchd/snapshot.plist.in`:
+Every tick `watch` takes a **light sample** first — one `ps` call (pid, ppid,
+%cpu, rss, etime, command) appended at once to `light/light-<day>.ndjson.gz`,
+outside the store and its lock — then starts the full snapshot in a child
+process, unless the last one is still running. A full snapshot that takes
+forty minutes on a pegged machine no longer costs forty minutes of samples,
+and two never overlap. Read the light samples with `sysobs light --since 1h`
+or `sysobs light --at 13:50`.
+
+A full snapshot that finds another sysobs holding the store lock skips its
+write at once instead of waiting 120 s for it.
+
+**Under load it takes priority.** When the one-minute load is over twice the
+cores (`SYSOBS_BOOST_FACTOR`), the sampler, its full snapshots and procwatch
+raise themselves as far as an unprivileged process can: Darwin background
+clamp cleared, nice back to 0 where the kernel allows, user-interactive
+thread QoS, throughput and latency tier 0 (`taskpolicy -t 0 -l 0`), and every
+`ps`/`top`/`lsof` they spawn under the same tiers. Work at background QoS then
+yields to them. `SYSOBS_BOOST=0` turns it off.
+
+Or leave it to the installer — `./install.sh` runs it under substrate as
+`sysobs` (`sub enable ... -- python3 sysobs watch`), or without substrate as
+the launchd agent `local.sysobs`, rendered from `contrib/launchd/snapshot.plist.in`:
 
 ```sh
 ./install.sh --interval 300            # the default
@@ -344,8 +368,8 @@ each is useful without the others:
 
 | agent | template | what it does |
 |---|---|---|
-| `local.sysobs` | `contrib/launchd/snapshot.plist.in` | a snapshot every 5 min, and the **only writer** of the tables — it also folds in procwatch's spool |
-| `local.sysobs-procwatch` | `contrib/launchd/procwatch.plist.in` | the always-on start/exit recorder; `KeepAlive`, so it comes back |
+| `sysobs` (substrate) or `local.sysobs` | `sub enable` or `contrib/launchd/snapshot.plist.in` | a light sample and a snapshot every 5 min; the snapshot is the **only writer** of the tables and folds in procwatch's spool |
+| `sysobs-proc` (substrate) or `local.sysobs-procwatch` | `sub enable` or `contrib/launchd/procwatch.plist.in` | the always-on start/exit recorder; restarted if it exits |
 | `local.sysobs-prune` | `contrib/launchd/prune.plist.in` | weekly `prune --days 14 --go` |
 
 Install any subset by hand if you want fewer: render the template you want,
@@ -474,6 +498,11 @@ it is obviously right:
   load incrementally
 
 Run it after every change; it is the contract, not a smoke test.
+
+## Releases
+
+[CHANGELOG.md](CHANGELOG.md), [FEATURES.md](FEATURES.md) and per-version notes in
+[docs/releases/](docs/releases/INDEX.md) — latest [v0.3.0](docs/releases/v0.3.0.md).
 
 ## Contributing
 

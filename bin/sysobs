@@ -13,7 +13,8 @@ arm, command -> file -> volume, because an executable lives on a volume and
 flattening it would repeat a volume UUID and mount point across ~18k files.
 
     sysobs snapshot [--files none|own|all] [--rdns] [--geo online] [--json]
-    sysobs watch --interval 60 [--count N]      repeated snapshots
+    sysobs watch --interval 300 [--count N]     light sample every tick, full when free
+    sysobs light [--since 1h | --at 13:50] [--by cpu|rss]   the cheap per-tick samples
     sysobs procwatch [--interval 0.1]           record every start/exit, live
     sysobs events [--since 1h] [--match java]   what started and stopped
     sysobs list [--json]                        snapshots on record
@@ -34,13 +35,16 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import ctypes.util
 import fcntl
+import gzip
 import hashlib
 import ipaddress
 import json
 import os
 import platform
 import re
+import shutil
 import socket as pysocket
 import sqlite3
 import struct
@@ -50,7 +54,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCHEMA_VERSION = 1
 
 # On AC, the battery discharging means the adapter could not cover demand.
@@ -289,6 +293,9 @@ SCHEMA["process_sample"].fks.pop("pid", None)
 
 # ============================================================ small helpers
 def _run(cmd: list[str], timeout: float = 60) -> tuple[int, str]:
+    # Under a pegged machine the collectors' children (ps, top, lsof) run at
+    # the priority the process raised itself to; see raise_priority().
+    cmd = boosted_argv(cmd)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                            errors="replace")
@@ -511,12 +518,18 @@ class Store:
         block that is wholly older. Memory is bounded by the window asked for,
         not by the table: read() of process_event held 13.3M rows, 20.9 GB, on
         every snapshot (the 2026-10-05 10:54 panic under memory pressure)."""
+        return {r[id_col] for r in self.tail_rows(table, ts_col, since, block) if id_col in r}
+
+    def tail_rows(self, table: str, ts_col: str, since: str,
+                  block: int = 1 << 22) -> list[dict]:
+        """The rows whose ts is at or after `since`, read from the end the same
+        way, oldest first."""
         p = self.tables / f"{table}.csv"
         if not p.exists():
-            return set()
+            return []
         cols = SCHEMA[table].columns
-        ii, ti = cols.index(id_col), cols.index(ts_col)
-        out: set[str] = set()
+        ti = cols.index(ts_col)
+        out: list[list[str]] = []
         with p.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
             pos, carry = fh.tell(), b""
@@ -527,16 +540,17 @@ class Store:
                 buf = fh.read(n) + carry
                 lines = buf.split(b"\n")
                 carry = lines.pop(0) if pos > 0 else b""   # may be a partial line
-                newest = ""
+                newest, got = "", []
                 for row in csv.reader(l.decode("utf-8", "replace") for l in lines if l):
-                    if len(row) <= max(ii, ti) or row[ii] == id_col:
+                    if len(row) <= ti or row[0] == cols[0]:
                         continue
                     newest = max(newest, row[ti])
                     if row[ti] >= since:
-                        out.add(row[ii])
+                        got.append(row)
+                out = got + out
                 if newest and newest < since:
                     break
-        return out
+        return [dict(zip(cols, r)) for r in out]
 
     def iter(self, table: str):
         """Rows one at a time, never the whole table in memory."""
@@ -1896,10 +1910,10 @@ def cmd_list(store: Store, as_json: bool) -> int:
     for r in runs:
         by_snap.setdefault(r["snapshot_id"], []).append(r)
     procs: dict[str, int] = {}
-    for r in store.read("process"):
+    for r in store.iter("process"):
         procs[r["snapshot_id"]] = procs.get(r["snapshot_id"], 0) + 1
     socks: dict[str, int] = {}
-    for r in store.read("socket"):
+    for r in store.iter("socket"):
         socks[r["snapshot_id"]] = socks.get(r["snapshot_id"], 0) + 1
     out = []
     for s in sorted(snaps, key=lambda r: r["snapshot_id"]):
@@ -1935,13 +1949,13 @@ def cmd_show(store: Store, ref: str, as_json: bool) -> int:
         return 1
     snap = next(r for r in store.read("snapshot") if r["snapshot_id"] == sid)
     hosts = {r["host_id"]: r for r in store.read("host")}
-    hs = next((r for r in store.read("host_sample") if r["snapshot_id"] == sid), {})
-    runs = [r for r in store.read("collector_run") if r["snapshot_id"] == sid]
+    hs = next((r for r in store.iter("host_sample") if r["snapshot_id"] == sid), {})
+    runs = [r for r in store.iter("collector_run") if r["snapshot_id"] == sid]
     per_table = {}
     for name, t in SCHEMA.items():
         if t.kind == "fact" and "snapshot_id" in t.columns:
-            per_table[name] = sum(1 for r in store.read(name) if r["snapshot_id"] == sid)
-    vols = [r for r in store.read("volume_sample") if r["snapshot_id"] == sid]
+            per_table[name] = sum(1 for r in store.iter(name) if r["snapshot_id"] == sid)
+    vols = [r for r in store.iter("volume_sample") if r["snapshot_id"] == sid]
     volumes = {r["volume_id"]: r for r in store.read("volume")}
     payload = {"snapshot": snap, "host": hosts.get(snap["host_id"], {}),
                "host_sample": hs, "collectors": runs, "row_counts": per_table,
@@ -1987,14 +2001,14 @@ def cmd_top(store: Store, ref: str, by: str, limit: int, as_json: bool) -> int:
         print(f"no snapshot matching {ref!r}", file=sys.stderr)
         return 1
     cmds = {r["command_id"]: r for r in store.read("command")}
-    procs = {r["pid"]: r for r in store.read("process") if r["snapshot_id"] == sid}
-    samples = {r["pid"]: r for r in store.read("process_sample") if r["snapshot_id"] == sid}
-    nets = {r["pid"]: r for r in store.read("process_net_sample") if r["snapshot_id"] == sid}
+    procs = {r["pid"]: r for r in store.iter("process") if r["snapshot_id"] == sid}
+    samples = {r["pid"]: r for r in store.iter("process_sample") if r["snapshot_id"] == sid}
+    nets = {r["pid"]: r for r in store.iter("process_net_sample") if r["snapshot_id"] == sid}
     files, sockets = {}, {}
-    for r in store.read("process_file"):
+    for r in store.iter("process_file"):
         if r["snapshot_id"] == sid:
             files[r["pid"]] = files.get(r["pid"], 0) + 1
-    for r in store.read("socket"):
+    for r in store.iter("socket"):
         if r["snapshot_id"] == sid:
             sockets[r["pid"]] = sockets.get(r["pid"], 0) + 1
     rows = []
@@ -2163,9 +2177,18 @@ OFFSETS = ROOT / "spool" / "offsets.json"
 LOCK = ROOT / ".store.lock"
 
 
+class LockBusy(TimeoutError):
+    """Another sysobs holds the store lock. A sampler that meets it skips its
+    full write instead of queueing behind it: a run that waited 120 s and then
+    died was a lost sample, and a second one queued behind it was another."""
+
+
 class StoreLock:
     """Whole-store write lock. Held across capture AND flush, because a
-    dimension read at the start is rewritten at the end."""
+    dimension read at the start is rewritten at the end.
+
+    timeout=0 tries once and raises LockBusy at once; the snapshot sampler
+    uses that. Readers that need the store (prune, the mirror) still wait."""
 
     def __init__(self, timeout: float = 120):
         self.timeout, self.fh = timeout, None
@@ -2179,14 +2202,221 @@ class StoreLock:
                 fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return self
             except OSError:
-                if time.time() > deadline:
-                    raise TimeoutError(f"store lock held by another sysobs for {self.timeout}s")
+                if time.time() >= deadline:
+                    self.fh.close()
+                    raise LockBusy(f"store lock held by another sysobs"
+                                   + (f" for {self.timeout:g}s" if self.timeout else ""))
                 time.sleep(0.05)
 
     def __exit__(self, *exc):
         fcntl.flock(self.fh, fcntl.LOCK_UN)
         self.fh.close()
         return False
+
+
+# ============================================================ priority under load
+# His 10-20 15:47: "it should probably dynamically give itself CPU priority
+# when the system is pegged. It shouldn't crap out. It's necessary that it
+# keeps going. It has to take priority."
+#
+# The same mechanism the narrator uses (auto-speech, ADR-019), without root:
+# clear any Darwin background clamp, put nice back to 0 where the kernel
+# allows, the calling thread to user-interactive QoS, the process to
+# throughput and latency tier 0 (taskpolicy -t 0 -l 0 -p <own pid>), and every
+# child the collectors spawn under taskpolicy -t 0 -l 0. Work run at
+# background QoS then yields to it. Nothing here refuses: a call the kernel
+# declines is noted in the report and the sample goes ahead.
+TASKPOLICY = "/usr/sbin/taskpolicy"
+TASKPOLICY_TIERS = ("-t", "0", "-l", "0")
+PRIO_DARWIN_PROCESS = 4                 # setpriority(2) "which" for the Darwin policy
+QOS_CLASS_USER_INTERACTIVE = 0x21       # pthread/qos.h
+try:                                    # load1 > factor x cores
+    BOOST_FACTOR = float(os.environ.get("SYSOBS_BOOST_FACTOR", "") or 2)
+except ValueError:
+    BOOST_FACTOR = 2.0
+BOOST = {"active": False, "load1": None, "cores": None, "notes": []}
+
+
+def boost_enabled() -> bool:
+    return os.environ.get("SYSOBS_BOOST", "1").strip() != "0"
+
+
+def _taskpolicy() -> str | None:
+    if os.path.isfile(TASKPOLICY) and os.access(TASKPOLICY, os.X_OK):
+        return TASKPOLICY
+    return shutil.which("taskpolicy")
+
+
+def boosted_argv(cmd: list[str]) -> list[str]:
+    """`cmd` under taskpolicy's top tiers while the process is boosted; `cmd`
+    itself otherwise. taskpolicy execs the command, so its exit code and
+    output are the command's own."""
+    if not BOOST["active"]:
+        return list(cmd)
+    tp = _taskpolicy()
+    return [tp, *TASKPOLICY_TIERS, *cmd] if tp else list(cmd)
+
+
+def load1() -> float:
+    """The one-minute load average. A seam: the tests stub it."""
+    try:
+        return float(os.getloadavg()[0])
+    except (OSError, AttributeError):
+        return 0.0
+
+
+def _setpriority(which: int, who: int, prio: int) -> None:
+    os.setpriority(which, who, prio)
+
+
+def _thread_qos_user_interactive() -> bool:
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        fn = libc.pthread_set_qos_class_self_np
+    except (OSError, AttributeError):
+        return False
+    fn.argtypes, fn.restype = (ctypes.c_uint, ctypes.c_int), ctypes.c_int
+    try:
+        return fn(QOS_CLASS_USER_INTERACTIVE, 0) == 0
+    except (OSError, ValueError):
+        return False
+
+
+def _tier_self(tp: str) -> int:
+    """taskpolicy -B -t 0 -l 0 -p <own pid>. Spawned bare, not through _run,
+    so it is not itself wrapped."""
+    try:
+        return subprocess.run([tp, "-B", *TASKPOLICY_TIERS, "-p", str(os.getpid())],
+                              capture_output=True, timeout=10).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return 126
+
+
+def raise_priority(load: float | None = None, cores: int | None = None) -> dict:
+    """When the one-minute load is over BOOST_FACTOR x the cores, raise this
+    process to the highest priority an unprivileged process can have, and
+    keep it there for the rest of its life (a sampler that drops back the
+    moment the load dips is late for the next spike). Called at the start of
+    every snapshot and every few seconds by procwatch, so it engages when the
+    machine becomes pegged, not only at start. Returns BOOST."""
+    if not boost_enabled():
+        return BOOST
+    load = load1() if load is None else load
+    cores = max(1, int(cores or os.cpu_count() or 1))
+    BOOST["load1"], BOOST["cores"] = round(load, 2), cores
+    if BOOST["active"] or load <= BOOST_FACTOR * cores:
+        return BOOST
+    notes: list[str] = []
+    try:
+        if os.getpriority(os.PRIO_PROCESS, 0) > 0:
+            _setpriority(os.PRIO_PROCESS, 0, 0)
+    except OSError as e:
+        notes.append(f"nice not restored ({type(e).__name__}): started niced")
+    try:
+        _setpriority(PRIO_DARWIN_PROCESS, 0, 0)          # clears PRIO_DARWIN_BG
+    except OSError as e:
+        notes.append(f"background clamp not cleared ({type(e).__name__})")
+    if not _thread_qos_user_interactive():
+        notes.append("thread QoS unchanged")
+    tp = _taskpolicy()
+    if not tp:
+        notes.append("no taskpolicy: tiers unchanged, children not wrapped")
+    elif _tier_self(tp) != 0:
+        notes.append("taskpolicy -p declined: own tiers unchanged")
+    BOOST["active"], BOOST["notes"] = True, notes
+    return BOOST
+
+
+def boost_text() -> str:
+    if not BOOST["active"]:
+        return ""
+    return (f"priority raised: load {BOOST['load1']} > {BOOST_FACTOR:g} x {BOOST['cores']} cores"
+            + (f" ({'; '.join(BOOST['notes'])})" if BOOST["notes"] else ""))
+
+
+# ============================================================ light sample
+# One ps call, written at once, before the full snapshot even asks for the
+# lock. Under a pegged machine the full snapshot can take tens of minutes or
+# not finish; the light sample is what answers "what was loading the Mac at
+# 13:50" when it does not. It lives beside the store, not in it: the store has
+# one writer and the light sample must never wait for it. One gzip member per
+# sample, appended with a single write, so two samplers never interleave.
+LIGHT = ROOT / "light"
+LIGHT_KEEP_DAYS = int(os.environ.get("SYSOBS_LIGHT_DAYS", "14") or 14)
+LIGHT_FIELDS = ("pid", "ppid", "cpu_pct", "rss_kb", "elapsed_s", "command")
+
+
+def light_path(when: float = None) -> Path:
+    day = datetime.fromtimestamp(when or time.time(), timezone.utc).strftime("%Y%m%d")
+    return LIGHT / f"light-{day}.ndjson.gz"
+
+
+def light_sample(note: str = "") -> dict:
+    """Take and write one light sample. Always writes a record: a ps that
+    failed is recorded as a sample with no processes and the reason."""
+    t0 = time.time()
+    rc, out = _run(["ps", "-Ao", "pid=,ppid=,%cpu=,rss=,etime=,command="], 60)
+    procs = []
+    for line in out.splitlines():
+        f = line.split(None, 5)
+        if len(f) < 5 or not f[0].isdigit():
+            continue
+        procs.append([int(f[0]), _num(f[1], int), _num(f[2]), _num(f[3], int),
+                      _etime_seconds(f[4]), (f[5] if len(f) > 5 else "")[:300]])
+    try:
+        la = [round(x, 2) for x in os.getloadavg()]
+    except OSError:
+        la = []
+    rec = {"ts": _iso_ms(t0), "load": la, "cores": os.cpu_count(),
+           "duration_ms": int((time.time() - t0) * 1000),
+           "status": "ok" if rc == 0 and procs else f"ps failed (rc {rc})",
+           "boost": boost_text(), "note": note, "fields": list(LIGHT_FIELDS),
+           "procs": procs}
+    light_write(rec)
+    return rec
+
+
+def light_write(rec: dict) -> Path:
+    LIGHT.mkdir(parents=True, exist_ok=True)
+    path = light_path()
+    data = gzip.compress((json.dumps(rec, separators=(",", ":")) + "\n").encode("utf-8"))
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=LIGHT_KEEP_DAYS)).strftime("%Y%m%d")
+    for old in LIGHT.glob("light-*.ndjson.gz"):
+        if old.name[6:14] < cutoff:
+            old.unlink()
+    return path
+
+
+def light_read(since: str = "", until: str = "9999") -> list[dict]:
+    """Light samples with since <= ts <= until, oldest first. A torn last
+    member (a write cut off mid-way) ends that file's read, it does not fail it."""
+    out = []
+    if not LIGHT.exists():
+        return out
+    for path in sorted(LIGHT.glob("light-*.ndjson.gz")):
+        day = path.name[6:14]
+        if since and day < since[:10].replace("-", ""):
+            continue
+        if day > until[:10].replace("-", ""):
+            continue
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if since <= r.get("ts", "") <= until:
+                        out.append(r)
+        except (EOFError, OSError):
+            pass
+    out.sort(key=lambda r: r.get("ts", ""))
+    return out
 
 
 def _iso_ms(epoch: float) -> str:
@@ -2391,17 +2621,25 @@ def ingest_commit(result: dict) -> None:
     OFFSETS.write_text(json.dumps(result["offsets"], indent=2))
 
 
+PROCWATCH_LOAD_EVERY = 10.0    # seconds between procwatch's load readings
+
+
 def cmd_procwatch(args) -> int:
+    raise_priority()
     watch = ProcWatch(interval=args.interval)
     n = watch.baseline()
     if not args.quiet:
         print(f"procwatch: {n} processes already live, polling every "
               f"{args.interval}s -> {spool_path()}", flush=True)
     buffer: list[dict] = []
-    last_flush = time.time()
+    last_flush = last_load = time.time()
     deadline = time.time() + args.seconds if args.seconds else None
     while True:
         time.sleep(args.interval)
+        if not BOOST["active"] and time.time() - last_load >= PROCWATCH_LOAD_EVERY:
+            last_load = time.time()
+            if raise_priority()["active"]:
+                print(f"procwatch: {boost_text()}", file=sys.stderr, flush=True)
         try:
             buffer += watch.tick()
         except Exception as e:                # noqa: BLE001 — never die silently
@@ -2854,8 +3092,23 @@ def selftest() -> int:
 
 # ============================================================ cli
 def cmd_snapshot(args) -> int:
+    """A light sample first, written at once; then the full snapshot if the
+    store is free. A run that finds another sysobs holding the store lock
+    does not wait for it: the light sample already holds this tick."""
+    raise_priority()
+    light = None if getattr(args, "no_light", False) else light_sample(note=args.note or "")
     store = Store()
-    with StoreLock():
+    try:
+        lock = StoreLock(timeout=0).__enter__()
+    except LockBusy as e:
+        msg = f"full snapshot skipped: {e}"
+        if args.json:
+            print(json.dumps({"snapshot_id": None, "skipped": msg,
+                              "light": _light_summary(light)}, indent=2))
+        else:
+            print(f"{_light_line(light)}\n  ~ {msg}" if light else f"  ~ {msg}", flush=True)
+        return 0
+    try:
         cap = Capture(store, files_mode=args.files, rdns=args.rdns, geo=args.geo,
                       note=args.note or "")
         sid = cap.run()
@@ -2866,31 +3119,151 @@ def cmd_snapshot(args) -> int:
         written = store.flush()
         if ingested:
             ingest_commit(ingested)
+    finally:
+        lock.__exit__(None, None, None)
     result = {"snapshot_id": sid, "root": str(store.root), "written": written,
-              "collectors": cap.runs, "events_ingested": ingested.get("events", 0)}
+              "collectors": cap.runs, "events_ingested": ingested.get("events", 0),
+              "light": _light_summary(light), "boost": boost_text()}
     if args.json:
         print(json.dumps(result, indent=2))
     else:
+        if light:
+            print(_light_line(light))
         print(f"{sid}  ->  {store.tables}")
         for name in sorted(written):
             print(f"  {name:<22} {written[name]:>8} rows")
         degraded = [r for r in cap.runs if r["degraded"] == 1 or r["status"] != "ok"]
         for r in degraded:
             print(f"  ~ {r['collector']}: {r['message']}")
+        if BOOST["active"]:
+            print(f"  ~ {boost_text()}")
     return 0
+
+
+def _light_summary(rec: dict | None) -> dict | None:
+    if not rec:
+        return None
+    return {k: rec[k] for k in ("ts", "load", "status", "duration_ms")} | {"processes": len(rec["procs"])}
+
+
+def _light_line(rec: dict) -> str:
+    return (f"light {rec['ts']}  load {' '.join(str(x) for x in rec['load'])}  "
+            f"{len(rec['procs'])} processes  {rec['status']}"
+            + (f"  ({rec['boost']})" if rec.get("boost") else ""))
+
+
+def _self_argv() -> list[str]:
+    """How to run this script again: the interpreter it was started with (the
+    absolute path the job gives, not whatever python3 PATH finds) and its own
+    file."""
+    exe = (getattr(sys, "orig_argv", None) or [sys.executable])[0]
+    exe = shutil.which(exe) or sys.executable
+    return [exe, str(Path(__file__).resolve())]
 
 
 def cmd_watch(args) -> int:
+    """The scheduled sampler. Every tick: a light sample, written at once;
+    then a full snapshot in a child process unless the last one is still
+    running. A full snapshot that takes forty minutes no longer costs forty
+    minutes of samples, and two full snapshots never overlap."""
+    full: subprocess.Popen | None = None
     n = 0
     while args.count == 0 or n < args.count:
-        rc = cmd_snapshot(args)
-        if rc:
-            return rc
+        tick = time.time()
+        # A tick that fails is said and the loop goes on: the sampler is the
+        # thing that must not stop when the machine is at its worst.
+        try:
+            raise_priority()
+            line = _light_line(light_sample(note=args.note or ""))
+        except Exception as e:                # noqa: BLE001
+            line = f"light sample failed: {type(e).__name__}: {e}"
+        if full is not None and full.poll() is None:
+            line += f"  ~ full snapshot still running (pid {full.pid}), not started"
+        else:
+            cmd = _self_argv() + ["snapshot", "--no-light", "--files", args.files,
+                                  "--note", args.note or ""]
+            if args.rdns:
+                cmd.append("--rdns")
+            if args.geo != "off":
+                cmd += ["--geo", args.geo]
+            try:
+                full = subprocess.Popen(cmd)
+                line += f"  full snapshot started (pid {full.pid})"
+            except OSError as e:
+                full = None
+                line += f"  ~ full snapshot not started: {e}"
+        print(line, flush=True)
         n += 1
         if args.count and n >= args.count:
             break
-        time.sleep(args.interval)
+        time.sleep(max(0.0, args.interval - (time.time() - tick)))
+    if full is not None:
+        full.wait()
     return 0
+
+
+def cmd_light(args) -> int:
+    """The light samples: one ps per tick, kept even when the full snapshot
+    could not finish. --at picks the sample nearest a time."""
+    if args.at:
+        at = _parse_when(args.at)
+        if not at:
+            print("--at wants 13:50 (local, today), 2026-10-20T13:50 (local) or an ISO time ending Z",
+                  file=sys.stderr)
+            return 2
+        pad = timedelta(minutes=30)
+        rows = light_read(_iso_ms((at - pad).timestamp()), _iso_ms((at + pad).timestamp()))
+        target = _iso_ms(at.timestamp())
+        rows = sorted(rows, key=lambda r: abs(datetime.fromisoformat(r["ts"].replace("Z", "+00:00"))
+                                              - at))[:1]
+        if not rows:
+            print(f"no light sample within 30 minutes of {target}")
+            return 0
+    else:
+        m = re.fullmatch(r"(\d+)([smhd])", args.since)
+        if not m:
+            print("--since wants 30m, 2h, 1d", file=sys.stderr)
+            return 2
+        secs = int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+        rows = light_read(_iso_ms(time.time() - secs))
+    key = {"cpu": 2, "rss": 3}[args.by]
+    out = []
+    for r in rows:
+        procs = sorted(r.get("procs", []), key=lambda p: p[key] if isinstance(p[key], (int, float)) else 0,
+                       reverse=True)
+        cpu_total = sum(p[2] for p in r.get("procs", []) if isinstance(p[2], (int, float)))
+        out.append({"ts": r["ts"], "load": r.get("load"), "cores": r.get("cores"),
+                    "status": r.get("status"), "boost": r.get("boost", ""),
+                    "processes": len(r.get("procs", [])), "cpu_pct_total": round(cpu_total, 1),
+                    "top": [dict(zip(LIGHT_FIELDS, p)) for p in procs[:args.limit]]})
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return 0
+    if not out:
+        print("no light samples in that window")
+        return 0
+    for r in out:
+        print(f"{r['ts']}  load {' '.join(str(x) for x in r['load'] or [])}  "
+              f"{r['processes']} processes  cpu {r['cpu_pct_total']}% total  {r['status']}")
+        for p in r["top"]:
+            rss = human((p["rss_kb"] or 0) * 1024) if isinstance(p["rss_kb"], int) else "?"
+            print(f"  {p['pid']:>7} {p['cpu_pct']:>6}% {rss:>8}  {p['command'][:110]}")
+    return 0
+
+
+def _parse_when(text: str) -> datetime | None:
+    """13:50 (local, today), 2026-10-20T13:50 (local), or ...Z (UTC)."""
+    text = text.strip()
+    try:
+        if re.fullmatch(r"\d{1,2}:\d{2}", text):
+            h, mi = (int(x) for x in text.split(":"))
+            return datetime.now().astimezone().replace(hour=h, minute=mi, second=0, microsecond=0)
+        if text.endswith("Z"):
+            return datetime.fromisoformat(text[:-1] + "+00:00")
+        dt = datetime.fromisoformat(text)
+        return dt if dt.tzinfo else dt.astimezone()
+    except ValueError:
+        return None
 
 
 def cmd_events(args) -> int:
@@ -2899,14 +3272,17 @@ def cmd_events(args) -> int:
     store = Store()
     ingested = {}
     if not args.no_ingest:
-        with StoreLock():
-            ingested = ingest_spool(store)
-            store.flush()
-            ingest_commit(ingested)
+        try:
+            with StoreLock(timeout=0):
+                ingested = ingest_spool(store)
+                store.flush()
+                ingest_commit(ingested)
+        except LockBusy:
+            # The snapshot job is folding the spool in right now; what is
+            # stored is read as it stands rather than waiting behind it.
+            print("(store busy: the newest spooled events are not folded in yet)",
+                  file=sys.stderr)
         store = Store()
-    rows = store.read("process_event")
-    cmds = {r["command_id"]: r for r in store.read("command")}
-    argvs = {r["argv_id"]: r["text"] for r in store.read("argv")}
     cutoff = ""
     if args.since:
         m = re.fullmatch(r"(\d+)([smhd])", args.since)
@@ -2915,6 +3291,13 @@ def cmd_events(args) -> int:
             return 2
         secs = int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
         cutoff = _iso_ms(time.time() - secs)
+    # Only the window, read from the end of the table, and only the argv rows
+    # it names: process_event and argv run to gigabytes, and holding them whole
+    # made this command unusable on a busy machine.
+    rows = store.tail_rows("process_event", "ts", cutoff) if cutoff else store.read("process_event")
+    cmds = {r["command_id"]: r for r in store.read("command")}
+    want = {r["argv_id"] for r in rows}
+    argvs = {r["argv_id"]: r["text"] for r in store.iter("argv") if r["argv_id"] in want}
     parent_of = {(r["pid"], r["started_at"]): r["parent_command_id"]
                  for r in rows if r["event"] == "start" and r["parent_command_id"]}
     out = []
@@ -3093,10 +3476,12 @@ def main(argv=None) -> int:
     sp.add_argument("--note", default="", help="free text stored with the snapshot")
     sp.add_argument("--no-ingest", action="store_true",
                     help="do not fold procwatch's spool into the store")
+    sp.add_argument("--no-light", action="store_true",
+                    help="skip the light sample (watch takes its own)")
     sp.set_defaults(fn=cmd_snapshot)
 
-    sp = common(sub.add_parser("watch", help="repeat snapshots on an interval"))
-    sp.add_argument("--interval", type=int, default=60)
+    sp = common(sub.add_parser("watch", help="light sample every tick, full snapshot when free"))
+    sp.add_argument("--interval", type=int, default=300)
     sp.add_argument("--count", type=int, default=0, help="0 = until interrupted")
     sp.add_argument("--files", choices=("none", "own", "all"), default="own")
     sp.add_argument("--rdns", action="store_true")
@@ -3112,6 +3497,13 @@ def main(argv=None) -> int:
     sp.add_argument("--echo", action="store_true", help="also print events as they happen")
     sp.add_argument("--quiet", action="store_true")
     sp.set_defaults(fn=cmd_procwatch)
+
+    sp = common(sub.add_parser("light", help="the light per-tick process samples"))
+    sp.add_argument("--since", default="1h", help="30m, 2h, 1d (default 1h)")
+    sp.add_argument("--at", default="", help="the sample nearest 13:50 (local) or an ISO time")
+    sp.add_argument("--by", choices=("cpu", "rss"), default="cpu")
+    sp.add_argument("-n", "--limit", type=int, default=10, help="processes per sample")
+    sp.set_defaults(fn=cmd_light)
 
     sp = common(sub.add_parser("events", help="process starts/exits between snapshots"))
     sp.add_argument("--since", default="1h", help="30m, 2h, 1d (default 1h)")

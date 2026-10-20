@@ -25,6 +25,9 @@ jobs:
       - name: selftest
         run: ./bin/sysobs selftest
 
+      - name: heavy-load tests
+        run: python3 -m unittest discover -s tests -q
+
       - name: install (no agents — CI has no launchd session)
         run: ./install.sh --no-agents --prefix "$RUNNER_TEMP/prefix" --label-prefix ci.sysobs
 
@@ -41,7 +44,7 @@ jobs:
       - name: rendered plists are valid
         run: |
           for t in contrib/launchd/*.plist.in; do
-            sed -e 's|@LABEL@|ci.sysobs|g' -e 's|@SYSOBS@|/usr/bin/true|g' \
+            sed -e 's|@LABEL@|ci.sysobs|g' -e 's|@SYSOBS@|/usr/bin/true|g' -e 's|@PY@|/usr/bin/python3|g' \
                 -e "s|@STORE@|$RUNNER_TEMP/store|g" -e "s|@LOGDIR@|$RUNNER_TEMP|g" \
                 -e 's|@INTERVAL@|300|g' -e 's|@POLL@|0.1|g' -e 's|@KEEPDAYS@|14|g' \
                 "$t" > "$RUNNER_TEMP/out.plist"

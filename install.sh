@@ -4,8 +4,13 @@
 #
 # Installs three things, each of which uninstall.sh knows how to remove:
 #   1. the `sysobs` executable on PATH (symlink to this checkout, or a copy)
-#   2. three launchd agents: snapshot, procwatch, prune
+#   2. the jobs: the sampler (`sysobs watch`) and procwatch under substrate
+#      (`sub enable`) when sub is on this machine, else as launchd agents;
+#      the weekly prune as a launchd agent either way
 #   3. svc descriptors, if svc is on this machine (optional, skipped silently)
+#
+# Every job runs an absolute interpreter (Homebrew's python3 when present):
+# launchd's PATH finds /usr/bin/python3, the Xcode 3.9 stub, otherwise.
 #
 # It does NOT create or touch the data store. sysobs makes that itself on first
 # write, and uninstall leaves it alone unless you ask for --purge.
@@ -29,7 +34,12 @@ THINTO=1h         # beyond that, keep one snapshot per bucket
 MODE=symlink      # or `copy`
 WANT_AGENTS=1
 WANT_SVC=auto
+WANT_SUB=auto
+WANT_SELFTEST=0
 DRYRUN=0
+SUB="${SYSOBS_SUB:-$(command -v sub 2>/dev/null || true)}"
+# superseded agents are moved here, never deleted
+ASIDE="${SYSOBS_ASIDE:-${XDG_STATE_HOME:-$HOME/.local/state}/sysobs-aside}"
 
 usage() {
   sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -48,6 +58,10 @@ usage: ./install.sh [options]
   --copy              copy the executable instead of symlinking it
   --no-agents         install the executable only, no launchd agents
   --no-svc            skip svc descriptors even if svc is installed
+  --no-substrate      launchd agents for the sampler and procwatch even if sub is installed
+  --python PATH       the interpreter the jobs run          (default Homebrew python3)
+  --selftest          run the selftest first and stop if it fails (off by default:
+                      its procwatch fixture can miss a 0.35 s process on a pegged machine)
   --dry-run           print what would happen, change nothing
   -h, --help          this
 
@@ -68,6 +82,9 @@ while [ $# -gt 0 ]; do
     --copy)         MODE=copy; shift ;;
     --no-agents)    WANT_AGENTS=0; shift ;;
     --no-svc)       WANT_SVC=0; shift ;;
+    --no-substrate) WANT_SUB=0; shift ;;
+    --python)       SYSOBS_PYTHON="$2"; shift 2 ;;
+    --selftest)     WANT_SELFTEST=1; shift ;;
     --dry-run)      DRYRUN=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     *) echo "install: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -89,25 +106,40 @@ step "Checking this machine can run sysobs"
 }
 say "macOS $(sw_vers -productVersion) — ok"
 
-command -v python3 >/dev/null || {
-  echo "python3 not found on PATH. sysobs is a single python3 script." >&2
+# The jobs name their interpreter by absolute path. launchd's PATH is
+# /usr/bin:/bin:..., where python3 is the Xcode 3.9 stub.
+PY="${SYSOBS_PYTHON:-}"
+if [ -z "$PY" ]; then
+  for c in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    [ -x "$c" ] && { PY="$c"; break; }
+  done
+fi
+[ -n "$PY" ] || PY="$(command -v python3 || true)"
+[ -n "$PY" ] && [ -x "$PY" ] || {
+  echo "python3 not found. sysobs is a single python3 script; give one with --python." >&2
   exit 1
 }
-PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-python3 - <<'PY' || { echo "sysobs needs python 3.9 or newer (found $PYV)." >&2; exit 1; }
+case "$PY" in /*) ;; *) PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")" ;; esac
+PYV="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+"$PY" - <<'PY' || { echo "sysobs needs python 3.9 or newer (found $PYV)." >&2; exit 1; }
 import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)
 PY
-say "python3 $PYV — ok"
+say "python $PYV at $PY — ok"
+
+if [ "$WANT_SUB" = auto ]; then
+  if [ -n "$SUB" ] && [ -x "$SUB" ]; then WANT_SUB=1; else WANT_SUB=0; fi
+fi
+[ "$WANT_SUB" = 1 ] && say "substrate at $SUB — the sampler and procwatch run under it"
 
 [ -x "$SRC/bin/sysobs" ] || { echo "$SRC/bin/sysobs missing or not executable." >&2; exit 1; }
 
-# The script is its own test suite. If the fixtures don't pass on this machine,
-# stop here rather than scheduling a job that will fail every five minutes.
-if [ "$DRYRUN" = 0 ]; then
-  if "$SRC/bin/sysobs" selftest >/dev/null 2>&1; then
+# The script is its own test suite. With --selftest, if the fixtures don't pass
+# on this machine, stop here rather than scheduling a job that will fail.
+if [ "$DRYRUN" = 0 ] && [ "$WANT_SELFTEST" = 1 ]; then
+  if "$PY" "$SRC/bin/sysobs" selftest >/dev/null 2>&1; then
     say "selftest — ok"
   else
-    echo "selftest FAILED. Not installing. Run: $SRC/bin/sysobs selftest" >&2
+    echo "selftest FAILED. Not installing. Run: $PY $SRC/bin/sysobs selftest" >&2
     exit 1
   fi
 fi
@@ -120,13 +152,12 @@ BIN="$PREFIX/bin"
 run mkdir -p "$BIN"
 TARGET="$BIN/sysobs"
 
-if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then run rm -f "$TARGET"; fi
 if [ "$MODE" = copy ]; then
-  run cp "$SRC/bin/sysobs" "$TARGET"
+  run cp -f "$SRC/bin/sysobs" "$TARGET"
   run chmod 755 "$TARGET"
   say "copied to $TARGET"
 else
-  run ln -s "$SRC/bin/sysobs" "$TARGET"
+  run ln -sfn "$SRC/bin/sysobs" "$TARGET"
   say "symlinked $TARGET -> $SRC/bin/sysobs"
 fi
 
@@ -139,12 +170,19 @@ esac
 # ---------------------------------------------------------------- agents
 
 if [ "$WANT_AGENTS" = 1 ]; then
-  step "Installing launchd agents"
+  step "Installing the jobs"
   run mkdir -p "$AGENTS" "$LOGDIR"
 
   L_SNAP="$LABEL_PREFIX"
   L_PROC="$LABEL_PREFIX-procwatch"
   L_PRUNE="$LABEL_PREFIX-prune"
+  # substrate names its agents dev.substrate.<name>; names are at most 15 chars
+  N_SNAP="sysobs"
+  N_PROC="sysobs-proc"
+  if [ "$WANT_SUB" = 1 ]; then
+    L_SNAP="dev.substrate.$N_SNAP"
+    L_PROC="dev.substrate.$N_PROC"
+  fi
 
   # Any sysobs agent under a DIFFERENT label prefix is a previous install.
   # Take it out before putting the new one in, or two collectors race for the
@@ -163,15 +201,17 @@ if [ "$WANT_AGENTS" = 1 ]; then
       say "leaving $oldlabel alone — it writes $oldstore, not $STORE"
       continue
     fi
-    say "superseding previous install: $oldlabel"
+    say "superseding previous install: $oldlabel (moved aside to $ASIDE)"
     run launchctl bootout "gui/$UID/$oldlabel" 2>/dev/null || true
-    run rm -f "$old"
-    run rm -f "$SVCDIR/$oldlabel.json"
+    run mkdir -p "$ASIDE"
+    run mv -f "$old" "$ASIDE/"
+    if [ -e "$SVCDIR/$oldlabel.json" ]; then run mv -f "$SVCDIR/$oldlabel.json" "$ASIDE/"; fi
   done
 
   render() {  # render TEMPLATE LABEL > DEST
     sed -e "s|@LABEL@|$2|g" \
         -e "s|@SYSOBS@|$TARGET|g" \
+        -e "s|@PY@|$PY|g" \
         -e "s|@STORE@|$STORE|g" \
         -e "s|@LOGDIR@|$LOGDIR|g" \
         -e "s|@SOURCE@|$SRC|g" \
@@ -195,8 +235,20 @@ if [ "$WANT_AGENTS" = 1 ]; then
     say "$label — loaded"
   }
 
-  install_agent "$SRC/contrib/launchd/snapshot.plist.in"  "$L_SNAP"
-  install_agent "$SRC/contrib/launchd/procwatch.plist.in" "$L_PROC"
+  if [ "$WANT_SUB" = 1 ]; then
+    # Under substrate: named, listed by sub ps / sub-top, restarted if they
+    # exit, stopped as a process group. No Nice, no Background ProcessType:
+    # both raise themselves further when the machine is pegged.
+    run "$SUB" enable --name "$N_SNAP" --role sampler --dir "$HOME" \
+        --env "SYSOBS_HOME=$STORE" \
+        -- "$PY" "$TARGET" watch --interval "$INTERVAL" --files none --note substrate
+    run "$SUB" enable --name "$N_PROC" --role watcher --dir "$HOME" \
+        --env "SYSOBS_HOME=$STORE" \
+        -- "$PY" "$TARGET" procwatch --interval "$POLL" --quiet
+  else
+    install_agent "$SRC/contrib/launchd/snapshot.plist.in"  "$L_SNAP"
+    install_agent "$SRC/contrib/launchd/procwatch.plist.in" "$L_PROC"
+  fi
   install_agent "$SRC/contrib/launchd/prune.plist.in"     "$L_PRUNE"
 
   # ------------------------------------------------------------- svc
@@ -218,10 +270,16 @@ fi
 step "Installed"
 say "executable   $TARGET"
 say "store        $STORE"
-[ "$WANT_AGENTS" = 1 ] && say "agents       $LABEL_PREFIX{,-procwatch,-prune}"
-say "logs         $LOGDIR/sysobs*.log"
+[ "$WANT_AGENTS" = 1 ] && say "jobs         $L_SNAP, $L_PROC, $L_PRUNE"
+say "interpreter  $PY"
+if [ "$WANT_SUB" = 1 ]; then
+  say "logs         $LOGDIR/substrate/{$N_SNAP,$N_PROC}.log, $LOGDIR/sysobs-prune.log"
+else
+  say "logs         $LOGDIR/sysobs*.log"
+fi
 printf '\n'
 say "First snapshot lands within a minute (RunAtLoad). Then:"
+say "  sysobs light         the light per-tick samples"
 say "  sysobs list          what has been captured"
 say "  sysobs show latest   one snapshot, fully resolved"
 say "  sysobs verify        referential integrity"

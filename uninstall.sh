@@ -96,9 +96,11 @@ fi
 belongs_to_this_install() {
   local plist="$1"
   [ -e "$plist" ] || return 0            # no plist to read: nothing to contradict
-  local prog
-  prog="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null)" || return 0
-  [ "$prog" = "$TARGET" ]
+  # the executable is argument 0, or argument 1 after an absolute interpreter
+  local prog0 prog1
+  prog0="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null)" || return 0
+  prog1="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$plist" 2>/dev/null || true)"
+  [ "$prog0" = "$TARGET" ] || [ "$prog1" = "$TARGET" ]
 }
 
 found=0
@@ -126,6 +128,24 @@ for label in "${labels[@]:-}"; do
   fi
 done
 [ "$found" = 0 ] && [ "$WANT_AGENTS" = 1 ] && say "none installed"
+
+# The sampler and procwatch run under substrate when install.sh found sub.
+SUB="${SYSOBS_SUB:-$(command -v sub 2>/dev/null || true)}"
+if [ "$WANT_AGENTS" = 1 ] && [ -n "$SUB" ]; then
+  for name in sysobs sysobs-proc; do
+    [ -e "$AGENTS/dev.substrate.$name.plist" ] || continue
+    # only the jobs that run THIS executable (a throwaway --prefix leaves the real ones)
+    if [ "$FORCE" = 0 ] && ! grep -qF "<string>$TARGET</string>" "$AGENTS/dev.substrate.$name.plist"; then
+      say "dev.substrate.$name — SKIPPED, it runs a different install"
+      continue
+    fi
+    run "$SUB" disable "$name"
+    say "dev.substrate.$name — disabled (sub)"
+    if [ -e "$SVCDIR/dev.substrate.$name.json" ]; then
+      run rm -f "$SVCDIR/dev.substrate.$name.json"
+    fi
+  done
+fi
 
 # procwatch is KeepAlive. If bootout raced a respawn, say so rather than
 # leaving a process quietly writing to a store we are about to declare removed.

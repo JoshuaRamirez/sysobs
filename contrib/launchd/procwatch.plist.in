@@ -5,6 +5,7 @@
   <key>Label</key>              <string>@LABEL@</string>
   <key>ProgramArguments</key>
   <array>
+    <string>@PY@</string>
     <string>@SYSOBS@</string>
     <string>procwatch</string>
     <string>--interval</string><string>@POLL@</string>
