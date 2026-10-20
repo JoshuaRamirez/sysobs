@@ -225,13 +225,30 @@ if [ "$WANT_AGENTS" = 1 ]; then
         "$1"
   }
 
+  # launchctl bootout returns before the job is gone; a bootstrap straight
+  # after it fails with "5: Input/output error". Wait for it to go.
+  unload_wait() {  # unload_wait LABEL
+    launchctl bootout "gui/$UID/$1" 2>/dev/null || true
+    for _ in $(seq 1 100); do
+      launchctl print "gui/$UID/$1" >/dev/null 2>&1 || return 0
+      sleep 0.1
+    done
+  }
+  load_retry() {  # load_retry PLIST
+    for _ in 1 2 3 4 5; do
+      launchctl bootstrap "gui/$UID" "$1" 2>/dev/null && return 0
+      sleep 1
+    done
+    launchctl bootstrap "gui/$UID" "$1"
+  }
+
   install_agent() {  # install_agent TEMPLATE LABEL
     local tmpl="$1" label="$2" dest="$AGENTS/$2.plist"
     if [ "$DRYRUN" = 1 ]; then say "would: write $dest and bootstrap $label"; return; fi
     render "$tmpl" "$label" > "$dest"
     plutil -lint "$dest" >/dev/null || { echo "generated $dest is not valid plist" >&2; exit 1; }
-    launchctl bootout "gui/$UID/$label" 2>/dev/null || true
-    launchctl bootstrap "gui/$UID" "$dest"
+    unload_wait "$label"
+    load_retry "$dest"
     say "$label — loaded"
   }
 
@@ -239,6 +256,9 @@ if [ "$WANT_AGENTS" = 1 ]; then
     # Under substrate: named, listed by sub ps / sub-top, restarted if they
     # exit, stopped as a process group. No Nice, no Background ProcessType:
     # both raise themselves further when the machine is pegged.
+    # sub enable boots the old job out and loads the new one at once; the
+    # old one is unloaded first so that load does not race the unload.
+    if [ "$DRYRUN" = 0 ]; then unload_wait "dev.substrate.$N_SNAP"; unload_wait "dev.substrate.$N_PROC"; fi
     run "$SUB" enable --name "$N_SNAP" --role sampler --dir "$HOME" \
         --env "SYSOBS_HOME=$STORE" \
         -- "$PY" "$TARGET" watch --interval "$INTERVAL" --files none --note substrate
@@ -257,8 +277,8 @@ if [ "$WANT_AGENTS" = 1 ]; then
       /usr/libexec/PlistBuddy -c "Delete :ProcessType" "$pl" >/dev/null 2>&1 || true
       /usr/libexec/PlistBuddy -c "Add :ProcessType string Interactive" "$pl"
       plutil -lint "$pl" >/dev/null
-      launchctl bootout "gui/$UID/dev.substrate.$n" 2>/dev/null || true
-      launchctl bootstrap "gui/$UID" "$pl"
+      unload_wait "dev.substrate.$n"
+      load_retry "$pl"
       say "dev.substrate.$n — ProcessType Interactive"
     done
   else
