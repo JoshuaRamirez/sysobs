@@ -5,6 +5,7 @@
   <key>Label</key>              <string>@LABEL@</string>
   <key>ProgramArguments</key>
   <array>
+    <string>@PY@</string>
     <string>@SYSOBS@</string>
     <string>prune</string>
     <string>--days</string><string>@KEEPDAYS@</string>

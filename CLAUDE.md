@@ -9,7 +9,8 @@ and is kept accurate; this file is the part that is easy to get wrong.
 ```
 bin/sysobs        the entire tool — one file, stdlib only, no third-party imports
 docs/gen_diagrams.py   regenerates docs/sysobs-diagrams.html (six logical diagram families)
-contrib/*.plist   launchd agent templates, __HOME__ substituted at install
+contrib/*.plist   launchd agent templates (used when substrate's `sub` is absent; prune always)
+tests/            heavy-load behaviour tests: python3 -m unittest discover -s tests
 README.md         what it does and why
 ```
 
@@ -32,8 +33,11 @@ row, duplicate re-ingest, replayed spool, in-place edit that must reach the
 mirror. If a change is right and selftest disagrees, selftest is probably
 describing a real regression.
 
-**The store has exactly one writer.** The 5-minute `local.sysobs` agent
-is it, and it holds `.store.lock` while writing. Dimension tables are rewritten
+**The store has exactly one writer.** The full snapshot that the 5-minute
+sampler (`sysobs watch`, substrate's `sysobs`) starts is it, and it holds
+`.store.lock` while writing. A snapshot that finds the lock held skips its
+write at once (`LockBusy`); it never queues behind it. The light sample is
+written outside the store (`light/`), so it never needs the lock. Dimension tables are rewritten
 whole on every flush, so a second concurrent writer silently drops the first
 one's rows. Consequences:
 

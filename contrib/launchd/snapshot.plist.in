@@ -5,16 +5,17 @@
   <key>Label</key>              <string>@LABEL@</string>
   <key>ProgramArguments</key>
   <array>
+    <string>@PY@</string>
     <string>@SYSOBS@</string>
-    <string>snapshot</string>
+    <string>watch</string>
+    <string>--interval</string><string>@INTERVAL@</string>
     <string>--files</string><string>none</string>
     <string>--note</string><string>launchd</string>
   </array>
-  <key>StartInterval</key>      <integer>@INTERVAL@</integer>
   <key>RunAtLoad</key>          <true/>
-  <key>ProcessType</key>        <string>Background</string>
-  <key>LowPriorityIO</key>      <true/>
-  <key>Nice</key>               <integer>10</integer>
+  <key>KeepAlive</key>          <true/>
+  <key>ThrottleInterval</key>   <integer>10</integer>
+  <key>ProcessType</key>        <string>Standard</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>SYSOBS_HOME</key>      <string>@STORE@</string>

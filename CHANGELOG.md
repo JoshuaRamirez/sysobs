@@ -3,6 +3,44 @@
 Notable changes. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 this project uses [Semantic Versioning](https://semver.org).
 
+## [0.3.0] — 2026-10-20
+
+It keeps sampling under heavy load (the Desk #m1020-1547-c8d1). Baseline
+`ca90e92`; release notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
+Tests: 106/106 selftest checks, 6/6 heavy-load tests.
+
+### Added
+
+- **Light sample.** One `ps` call per tick (pid, ppid, %cpu, rss, etime,
+  command), written at once to `light/light-<day>.ndjson.gz` before the full
+  snapshot asks for the lock. `sysobs light --since 1h | --at 13:50 [--by cpu|rss]`.
+- **Priority under load.** Over 2x the cores of one-minute load, the sampler,
+  its snapshots and procwatch clear the background clamp, go to
+  user-interactive thread QoS and tier 0, and run their children under
+  `taskpolicy -t 0 -l 0`. `SYSOBS_BOOST=0` off, `SYSOBS_BOOST_FACTOR` the threshold.
+- `tests/test_sample_under_load.py`: lock held, cut-off snapshot, stubbed
+  load, procwatch under substrate.
+
+### Changed
+
+- **`watch` is the scheduled sampler**: a light sample every tick, the full
+  snapshot in a child unless the last is still running. Default interval 300.
+- **The sampler and procwatch run under substrate** (`sub enable`) when `sub`
+  is installed; launchd agents otherwise. Every job names an absolute
+  interpreter (Homebrew python3 by default, `--python`): under launchd,
+  `python3` was the Xcode 3.9 stub. No more `Nice 10` / `Background` on the
+  sampler.
+- `install.sh` moves superseded agents aside (`SYSOBS_ASIDE`) instead of
+  deleting them; the selftest preflight is opt-in (`--selftest`).
+- `list`, `show`, `top` stream the fact tables; `events` reads only its window
+  from the end of `process_event` and only the argv rows it names.
+
+### Fixed
+
+- **A snapshot waited 120 s on the store lock and then died** with
+  `TimeoutError`. It now skips its write at once (`LockBusy`), as does the
+  ingest in `events`.
+
 ## [0.2.0] — 2026-09-20
 
 The release that made it installable by someone other than its author.
