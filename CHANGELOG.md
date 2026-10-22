@@ -3,6 +3,24 @@
 Notable changes. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 this project uses [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- **A menu-bar app**, `app/` (SysObs.app, `com.redjay.sysobs`, 0.1.0): the
+  latest snapshot and the machine-wide picture (load, CPU, memory, swap), the
+  top processes by CPU and by memory from the newest light sample, the last
+  hour's process starts and exits, "Take a Snapshot Now", and a Settings window
+  for the refresh interval (30 s) and the list length (5). The standard look of
+  DeskHub and Teams Watch: an NSStatusItem (autosave name `sysobs`) with a
+  SwiftUI menu, LSUIElement, ad-hoc signed, installed to `~/Applications` by
+  `app/build.sh` (never launched unless `--launch`). It reads the tails of
+  `snapshot.csv`, `host_sample.csv` and the procwatch spool, and runs
+  `sysobs light --json`; `show`, `top` and `events` stream gigabyte tables and
+  took 19 s to 2 min under load. The parsing and every phrase shown live in
+  the `SysObsCore` library, 35 XCTest checks on fixtures cut from a real store.
+  [docs/menu-bar-app.md](docs/menu-bar-app.md).
+
 ## [0.3.0] — 2026-10-20
 
 It keeps sampling under heavy load (the Desk #m1020-1547-c8d1). Baseline

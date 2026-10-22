@@ -21,6 +21,14 @@
 - `db`, `query`: the SQLite mirror and SQL against it.
 - `verify`, `schema`: referential integrity, the schema.
 
+## Menu bar (app/)
+
+- SysObs.app: the latest snapshot and the machine-wide picture (load, CPU,
+  memory, swap), the top processes by CPU and by memory from the newest light
+  sample, the last hour's starts and exits, "Take a Snapshot Now", a Settings
+  window (refresh interval, list length). Reads the store's tails and
+  `sysobs light --json`; never a writer. `docs/menu-bar-app.md`.
+
 ## Keeping
 
 - `prune`: tiered retention that keeps references intact.
