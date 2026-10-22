@@ -5,6 +5,13 @@ this project uses [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-22
+
+The menu-bar app, and the repository made ready for public readers. Baseline
+`3ca7fbd` (v0.3.0); commits `3ca7fbd..` this release. Release notes:
+[docs/releases/v0.4.0.md](docs/releases/v0.4.0.md).
+Tests: selftest 107/107; 7/7 heavy-load tests; 35/35 SysObsCore XCTests.
+
 ### Added
 
 - **A menu-bar app**, `app/` (SysObs.app, `com.redjay.sysobs`, 0.1.0): the
@@ -20,6 +27,17 @@ this project uses [Semantic Versioning](https://semver.org).
   took 19 s to 2 min under load. The parsing and every phrase shown live in
   the `SysObsCore` library, 35 XCTest checks on fixtures cut from a real store.
   [docs/menu-bar-app.md](docs/menu-bar-app.md).
+
+### Changed
+
+- README: a "What it looks like" section with real (made generic) output of
+  `light`, `events`, `show`, `top` and `list`, and a "Menu bar" section with the
+  app's build steps. `VERSION` and `sysobs --version` say 0.4.0.
+
+### Fixed
+
+- The SysObsCore test fixtures carried the author's home path; they now use a
+  generic one of the same length, so the width-clamped assertions still hold.
 
 ## [0.3.0] — 2026-10-20
 

@@ -54,7 +54,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SCHEMA_VERSION = 1
 
 # On AC, the battery discharging means the adapter could not cover demand.

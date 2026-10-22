@@ -33,6 +33,95 @@ sysobs verify                   # every reference resolves?
 sysobs db && sysobs query "..." # SQL, with the FKs enforced by SQLite
 ```
 
+## What it looks like
+
+Every reading below is from a real store, with the command lines made generic.
+`light` is the cheap sample the scheduled sampler takes every tick (one `ps`);
+it answers "what was loading the machine at 13:50" in under a second:
+
+```
+$ sysobs light --since 10m --by cpu
+2026-10-22T19:57:14.734Z  load 10.02 10.26 9.21  1731 processes  cpu 653.6% total  ok
+    68932  168.2%   251.9M  mediaanalysisd
+    96293   99.4%   401.2M  Python ~/tools/indexer --rebuild
+    36990   97.9%    23.0M  Python ~/tools/roster watch
+      681   40.1%   541.7M  iTerm2
+      404   28.1%   654.8M  WindowServer -daemon
+    86838   14.1%     1.5G  node ~/projects/app/server.js
+      689   12.1%    75.1M  Finder
+```
+
+`events` is procwatch's record of what started and stopped, with the parent
+that launched each one:
+
+```
+$ sysobs events --since 10m
+WHEN                     EVENT     PID    PPID     LIVED  COMMAND            PARENT / ARGV
+2026-10-22T20:05:19.169Z exit    56934       1      4.0s  mdworker_shared    launchd | /System/Library/Frameworks/CoreServices.framework/…
+2026-10-22T20:05:19.169Z exit    57577   20368      2.0s  sleep              zsh | sleep 2
+2026-10-22T20:05:19.169Z exit    57590   44820      2.0s  bash               bash | bash ./build.sh --check
+2026-10-22T20:05:20.179Z start   58241       1            mdworker_shared    launchd | /System/Library/Frameworks/CoreServices.framework/…
+2026-10-22T20:05:20.179Z start   58276   58214            git                zsh | git -C ~/projects/app status --short
+```
+
+`show` reads one full snapshot back: the machine-wide picture, the row counts
+per table, and how each collector fared (`ok`, `~` degraded with the reason,
+or failed):
+
+```
+$ sysobs show
+s_20261022T200214Z   2026-10-22T20:02:14Z   2820ms   v0.4.0
+host    mac.local  Mac16,5  Apple M4 Max  16 cpu  128.0G ram  Darwin 26.6.2
+load    10.07 9.07 8.87   cpu 27.46% user / 15.22% sys / 57.3% idle   up 401170s
+memory  118.0G used  9.0G wired  6.2G compressed  3.7G free  swap 3.0G/4.0G
+network 475.0G in / 451.0G out   disk 17.0T read / 6.9T written
+
+rows
+  process                    1727
+  process_sample             1727
+  socket                      366
+  process_net_sample          132
+  interface_sample             23
+  volume_sample                13
+  collector_run                10
+  disk_io_sample                4
+  snapshot                      1
+  host_sample                   1
+  power_sample                  1
+
+collectors
+  ok  host               18ms       1 rows
+  ok  volume              9ms      13 rows
+  ok  power              16ms       1 rows
+  ok  host_sample       974ms       1 rows
+  ok  disk_io          1008ms       4 rows
+  ok  interface           8ms      23 rows
+  ~   process           576ms    1727 rows  1380 processes carry kernel task info, 347 do not (not owned by uid 501)
+  ok  process_net        26ms     132 rows
+```
+
+`top` ranks the processes of one snapshot by CPU, memory, files, sockets or
+bytes moved; `list` shows the snapshots on disk with how long each took and
+what, if anything, was degraded:
+
+```
+$ sysobs top --by net
+s_20261022T200214Z  by net
+    PID USER           CPU%      RSS   THR       NET  FILES  SOCK  COMMAND
+  28572 jsmith          0.0   159.9M    27    155.9M      0    63  Google Chrome Helper (Renderer)
+  28897 jsmith          0.0    16.4M     5    151.8M      0     3  Python
+    507 _mdnsrespond    0.1    26.2M           46.5M      0     0  mDNSResponder
+
+$ sysobs list
+SNAPSHOT                   STARTED                   MS  PROCS  SOCKS  NOTES
+s_20261022T195214Z         2026-10-22T19:52:14Z    2611   1724    371
+s_20261022T195714Z         2026-10-22T19:57:14Z    2702   1731    368
+s_20261022T200214Z         2026-10-22T20:02:14Z    2820   1727    366
+```
+
+The same store answers SQL: `sysobs db` builds a SQLite mirror with every
+foreign key declared, and `sysobs query` runs against it.
+
 ## What it collects, and where it goes
 
 **Nowhere.** sysobs makes no network connection of its own. The store is local,
@@ -452,6 +541,23 @@ was performed while the 5-minute agent was running the same script and wrote a
 few hundred column-shifted rows. Stop the agent first, or write through the
 tool under `.store.lock`.
 
+## Menu bar
+
+`app/` is SysObs.app: the latest snapshot and the machine-wide picture (load,
+CPU, memory, swap), the top processes by CPU and by memory from the newest
+light sample, the last hour's process starts and exits, "Take a Snapshot Now",
+and a Settings window for the refresh interval and the list length. It only
+reads the store and runs `sysobs light --json`; it never writes. Requires
+macOS 14.4+ and Xcode's Swift toolchain.
+
+```sh
+bash app/build.sh            # build, bundle, ad-hoc sign, install to ~/Applications (not launched)
+bash app/build.sh --launch   # ...and open it
+cd app && swift test         # SysObsCore on fixture data, no live calls
+```
+
+How it reads the store and what every phrase means: [docs/menu-bar-app.md](docs/menu-bar-app.md).
+
 ## Diagrams
 
 `docs/sysobs-diagrams.html` is a single self-contained page — no network, no
@@ -502,7 +608,7 @@ Run it after every change; it is the contract, not a smoke test.
 ## Releases
 
 [CHANGELOG.md](CHANGELOG.md), [FEATURES.md](FEATURES.md) and per-version notes in
-[docs/releases/](docs/releases/INDEX.md) — latest [v0.3.0](docs/releases/v0.3.0.md).
+[docs/releases/](docs/releases/INDEX.md) — latest [v0.4.0](docs/releases/v0.4.0.md).
 
 ## Contributing
 
