@@ -1,4 +1,4 @@
-# sysobs features (v0.3.0)
+# sysobs features (v0.4.0)
 
 ## Recording
 

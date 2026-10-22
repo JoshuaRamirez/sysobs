@@ -28,7 +28,7 @@ final class FormatTests: XCTestCase {
         XCTAssertEqual(Format.shortCommand("/System/Library/XprotectService"), "XprotectService")
         XCTAssertEqual(Format.shortCommand("sleep 2"), "sleep 2")
         XCTAssertEqual(Format.shortCommand(""), "")
-        let long = "/Applications/Ollama.app/Contents/Resources/llama-server --model /Users/joshua/.ollama/models/blobs/sha256-dfd98d --port 62600"
+        let long = "/Applications/Ollama.app/Contents/Resources/llama-server --model /Users/jsmith/.ollama/models/blobs/sha256-dfd98d --port 62600"
         let cut = Format.shortCommand(long, width: 40)
         XCTAssertEqual(cut.count, 40)
         XCTAssertTrue(cut.hasPrefix("llama-server --model"))
@@ -37,7 +37,7 @@ final class FormatTests: XCTestCase {
 
     func testBasename() {
         XCTAssertEqual(Format.basename("/bin/zsh"), "zsh")
-        XCTAssertEqual(Format.basename("/Users/joshua/.local/share/claude/versions/2.1.304"), "2.1.304")
+        XCTAssertEqual(Format.basename("/Users/jsmith/.local/share/claude/versions/2.1.304"), "2.1.304")
         XCTAssertEqual(Format.basename("codex"), "codex")
         XCTAssertEqual(Format.basename(""), "")
     }
