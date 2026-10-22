@@ -12,7 +12,7 @@ final class LightSampleTests: XCTestCase {
       {"ts": "2026-10-22T07:37:13.842Z", "load": [316.14, 245.65, 135.3], "cores": 16, "status": "ok",
        "boost": "priority raised: load 316.14 > 2 x 16 cores", "processes": 1899, "cpu_pct_total": 883.8,
        "top": [{"pid": 64015, "ppid": 3638, "cpu_pct": 187.7, "rss_kb": 27974080, "elapsed_s": 781, "command": "/Applications/Ollama.app/Contents/Resources/llama-server --model x"},
-               {"pid": 36940, "ppid": 36937, "cpu_pct": 49.3, "rss_kb": 25296, "elapsed_s": 294, "command": "/Applications/Xcode.app/Contents/Developer/usr/bin/git -C /Users/joshua/Obsidian/AspenESS log --all -p"}]}
+               {"pid": 36940, "ppid": 36937, "cpu_pct": 49.3, "rss_kb": 25296, "elapsed_s": 294, "command": "/Applications/Xcode.app/Contents/Developer/usr/bin/git -C /Users/jsmith/Obsidian/notes log --all -p"}]}
     ]
     """
 
@@ -40,7 +40,7 @@ final class LightSampleTests: XCTestCase {
         let latest = try XCTUnwrap(LightSample.latest(Data(Self.fixture.utf8)))
         XCTAssertEqual(latest.top[0].line(by: .cpu), "187.7%  llama-server --model x")
         XCTAssertEqual(latest.top[0].line(by: .rss), "26.7G  llama-server --model x")
-        XCTAssertEqual(latest.top[1].line(by: .cpu, width: 30), "49.3%  git -C /Users/joshua/Obsidian…")
+        XCTAssertEqual(latest.top[1].line(by: .cpu, width: 30), "49.3%  git -C /Users/jsmith/Obsidian…")
     }
 
     func testBadInputIsEmpty() {
