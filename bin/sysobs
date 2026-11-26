@@ -292,13 +292,42 @@ SCHEMA["process_sample"].fks.pop("pid", None)
 
 
 # ============================================================ small helpers
+# Children start clean (his rule, 26 Nov 2026: no clone-first starts, nothing
+# inherited unless named). The snapshot process grows to gigabytes and has
+# threads; CPython forks for a child unless it can use posix_spawn, which it
+# does only for an absolute program path with close_fds=False, no cwd, no new
+# session and no preexec_fn. close_fds=False is safe: every descriptor Python
+# (and SQLite) opens is close-on-exec (PEP 446), so only the pipes reach the
+# child. Its environment is built: these names, SYSOBS_* settings, nothing else.
+CHILD_ENV_NAMES = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ",
+                   "TERM", "LANG", "LC_ALL", "LC_CTYPE", "XDG_STATE_HOME")
+DEFAULT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+
+
+def child_env() -> dict[str, str]:
+    """The environment a child gets: a few names and sysobs' own settings."""
+    env = {k: v for k, v in os.environ.items()
+           if k in CHILD_ENV_NAMES or k.startswith("SYSOBS_")}
+    env.setdefault("PATH", DEFAULT_PATH)
+    return env
+
+
+def spawn_argv(cmd: list[str]) -> list[str]:
+    """`cmd` with its program as an absolute path (posix_spawn needs one);
+    unchanged when it cannot be found, so the start fails as before."""
+    if not cmd or "/" in cmd[0]:
+        return list(cmd)
+    found = shutil.which(cmd[0], path=child_env()["PATH"])
+    return [found, *cmd[1:]] if found else list(cmd)
+
+
 def _run(cmd: list[str], timeout: float = 60) -> tuple[int, str]:
     # Under a pegged machine the collectors' children (ps, top, lsof) run at
     # the priority the process raised itself to; see raise_priority().
-    cmd = boosted_argv(cmd)
+    cmd = spawn_argv(boosted_argv(cmd))
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           errors="replace")
+                           errors="replace", env=child_env(), close_fds=False)
         return p.returncode, p.stdout
     except FileNotFoundError:
         return 127, ""
@@ -2286,8 +2315,9 @@ def _tier_self(tp: str) -> int:
     """taskpolicy -B -t 0 -l 0 -p <own pid>. Spawned bare, not through _run,
     so it is not itself wrapped."""
     try:
-        return subprocess.run([tp, "-B", *TASKPOLICY_TIERS, "-p", str(os.getpid())],
-                              capture_output=True, timeout=10).returncode
+        return subprocess.run(spawn_argv([tp, "-B", *TASKPOLICY_TIERS, "-p", str(os.getpid())]),
+                              capture_output=True, timeout=10, env=child_env(),
+                              close_fds=False).returncode
     except (OSError, subprocess.TimeoutExpired):
         return 126
 
@@ -3224,7 +3254,7 @@ def cmd_watch(args) -> int:
             if args.geo != "off":
                 cmd += ["--geo", args.geo]
             try:
-                full = subprocess.Popen(cmd)
+                full = subprocess.Popen(spawn_argv(cmd), env=child_env(), close_fds=False)
                 line += f"  full snapshot started (pid {full.pid})"
             except OSError as e:
                 full = None

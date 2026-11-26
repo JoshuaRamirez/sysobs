@@ -234,5 +234,42 @@ class TestProcwatchUnderSubstrate(unittest.TestCase):
             self.assertNotIn("local.sysobs-procwatch.plist", p.stdout)
 
 
+class TestChildrenStartClean(unittest.TestCase):
+    """His rule, 26 Nov 2026: no clone-first starts, nothing inherited unless
+    named. A collector's child is started by posix_spawn (CPython forks
+    otherwise) with a built environment."""
+
+    def test_run_spawns_without_forking_and_passes_only_named_variables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = load_sysobs(Path(tmp))
+            real = os.posix_spawn
+            calls = []
+
+            def counting(path, argv, env, **kw):
+                calls.append((path, argv, dict(env)))
+                return real(path, argv, env, **kw)
+
+            leak = {"CG_FOLLOW_FROM_LSN": "1", "SOME_TOKEN": "secret", "SYSOBS_BOOST": "1"}
+            with mock.patch.dict(os.environ, leak), \
+                    mock.patch.object(os, "posix_spawn", counting), \
+                    mock.patch.object(mod.os, "fork", side_effect=AssertionError("forked")):
+                rc, out = mod._run(["env"], 20)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(calls), 1, "the child was not started by posix_spawn")
+            self.assertTrue(calls[0][0].startswith("/"))
+            names = {ln.split("=", 1)[0] for ln in out.splitlines() if "=" in ln}
+            self.assertNotIn("CG_FOLLOW_FROM_LSN", names)
+            self.assertNotIn("SOME_TOKEN", names)
+            self.assertIn("SYSOBS_BOOST", names)
+            self.assertIn("PATH", names)
+            self.assertTrue(names <= set(mod.CHILD_ENV_NAMES) | {n for n in names if n.startswith("SYSOBS_")} | {"__CF_USER_TEXT_ENCODING"},
+                            names)
+
+    def test_a_missing_program_still_answers_127(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = load_sysobs(Path(tmp))
+            self.assertEqual(mod._run(["no-such-program-sysobs"], 5)[0], 127)
+
+
 if __name__ == "__main__":
     unittest.main()
